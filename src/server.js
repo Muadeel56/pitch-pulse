@@ -3,6 +3,7 @@ import Fastify from 'fastify';
 import { logger } from './utils/logger.js';
 import { prisma } from './lib/prisma.js';
 import authenticatePlugin from './plugins/authenticate.js';
+import errorHandlerPlugin from './plugins/errorHandler.js';
 import authRoutes from './routes/auth.js';
 import matchesRoutes from './routes/matches.js';
 import followsRoutes from './routes/follows.js';
@@ -10,9 +11,12 @@ import followsRoutes from './routes/follows.js';
 const fastify = Fastify({ logger: false }); // using our own logger.js instead of pino's default
 
 // Called directly (not via fastify.register) so the `authenticate` decorator
-// lands on the root instance instead of being scoped to a child encapsulation
-// context — otherwise sibling plugins like authRoutes can't see it.
+// and the error handler land on the root instance instead of being scoped to
+// a child encapsulation context — otherwise sibling plugins like authRoutes
+// can't see them. Must be registered before the routes below so every route
+// throw (Zod, Prisma, NotFoundError, ...) is caught centrally.
 await authenticatePlugin(fastify);
+await errorHandlerPlugin(fastify);
 await fastify.register(authRoutes);
 await fastify.register(matchesRoutes, { prefix: '/matches' });
 await fastify.register(followsRoutes, { prefix: '/follows' });
