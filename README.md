@@ -17,18 +17,22 @@ We evaluated [CricAPI](https://cricapi.com/) and
 rate-limited API keys, and at this stage of the project we haven't registered
 for and validated a live key against real network access.
 
-Per the project docs' explicit fallback clause, we're deferring live API
-integration for now and will implement a **mock data generator** (random
-score increments every few seconds) as the data source for Phase 3/4. This
-still teaches 100% of the Node concepts the project is after — background
-polling, diffing, caching, real-time push — without live-API access blocking
-progress.
+Per the project docs' explicit fallback clause, we deferred live API
+integration and built Phase 3's client with a **pluggable data source**:
 
-`src/lib/cricketApiClient.js` stays a stub in this phase. Phase 3 will
-implement it against either a real free-tier key (if one is obtained and
-manually curl-verified at that time) or the mock generator, whichever proves
-viable. `CRICKET_API_KEY` is present in `.env.example` for forward
-compatibility but unused until then.
+- **Mock provider (default):** used whenever `CRICKET_API_KEY` is empty.
+  Emits the same external response shape a real API would (so both providers
+  flow through one parse/normalize path), evolves live matches' scores/overs
+  on a wall-clock basis, and can inject timeout / 429 / 500 / malformed-body
+  failures on demand (`CRICKET_MOCK_FAIL`, or `__setMockFailure()` in tests).
+- **HTTP provider:** real `fetch` against `CRICKET_API_BASE_URL`
+  (CricAPI-style `/currentMatches` + `/match_info`), used when
+  `CRICKET_API_KEY` is set.
+
+The resilience layer — retry with backoff, rate-limit handling, defensive
+parsing, logging, typed errors — is **identical for both**. Obtaining a real
+key later is a config change; no consumer moves. See "External API client"
+below.
 
 ## Project structure
 
@@ -38,12 +42,12 @@ pitch-pulse/
 │   ├── server.js            # Fastify app entrypoint
 │   ├── routes/
 │   │   ├── auth.js          # signup / login / me
-│   │   ├── matches.js       # GET /matches/live, GET /matches/:id (mock data)
+│   │   ├── matches.js       # GET /matches/live, GET /matches/:id (via cricketApiClient)
 │   │   └── follows.js       # follow/unfollow team/player, GET /follows
 │   ├── plugins/
 │   │   ├── authenticate.js  # JWT auth hook (fastify.authenticate)
 │   │   └── errorHandler.js  # centralized setErrorHandler / setNotFoundHandler
-│   ├── errors.js            # NotFoundError, thrown by routes and mapped to 404
+│   ├── errors.js            # NotFoundError + ApiRateLimit/Unavailable/ParseError
 │   ├── jobs/
 │   │   └── pollScores.js    # stub — Phase 4
 │   ├── realtime/
@@ -54,8 +58,11 @@ pitch-pulse/
 │   │   └── redisClient.js   # ioredis client
 │   ├── lib/
 │   │   ├── prisma.js        # PrismaClient singleton
-│   │   ├── cricketApiClient.js # stub — Phase 3
-│   │   └── mockMatches.js   # isolated mock match data source (Phase 2)
+│   │   ├── cricketApiClient.js # resilient client — getLiveMatches / getMatchDetail (Phase 3)
+│   │   ├── retry.js         # generic withRetry(fn, opts) — jittered backoff
+│   │   ├── cricketSchemas.js # loose Zod schemas + normalize to internal shape
+│   │   ├── mockCricketApi.js # default data provider (evolving scores, failure injection)
+│   │   └── mockMatches.js   # fixture seed for mockCricketApi (Phase 2 shape)
 │   ├── schemas/
 │   │   ├── auth.js          # zod schemas
 │   │   ├── follows.js       # zod schemas (teamId/playerId params)
@@ -143,11 +150,58 @@ trace or Fastify's default `{ statusCode, error, message }` body:
 | `NotFoundError` (unknown team/player/match)       | 404    | `NOT_FOUND`         |
 | Unmatched route                                  | 404    | `NOT_FOUND`         |
 | Prisma `P2002` (duplicate follow)                | 409    | `ALREADY_FOLLOWING` |
+| `ApiParseError` (bad upstream shape)             | 502    | `BAD_GATEWAY`       |
+| `ApiRateLimitError` / `ApiUnavailableError`      | 503    | `SERVICE_UNAVAILABLE` |
 | Anything else                                    | 500    | `INTERNAL_ERROR`    |
 
 Routes that already build their own response directly (auth.js's 401s/409s,
 authenticate.js's 401s) never throw, so they're unaffected by this handler —
 it's purely the fallback for everything that does.
+
+The 502/503 rows fire when a `/matches/*` route calls the cricket API client
+and the upstream provider misbehaves — a `Retry-After` header is echoed on the
+503 when the client knows one. Phase 4's polling job catches these itself
+(logs, keeps going) and never reaches this handler.
+
+## External API client
+
+`src/lib/cricketApiClient.js` is the **only** way the app gets match data —
+`getLiveMatches()` and `getMatchDetail(id)`, both returning the internal shape
+`{ id, teams, status, score, overs }`. No `fetch` or `console.*` lives outside
+this module (and `retry.js`). It picks the mock or HTTP provider from config
+(see "Cricket data source decision"), then runs every call through one
+pipeline: rate-limit gate → `withRetry` → Zod parse → normalize → log.
+
+**Typed errors** (`src/errors.js`), thrown by the client:
+
+| Error                 | Thrown when                                             | Carries                                   | HTTP (direct route call) |
+| --------------------- | ------------------------------------------------------ | ----------------------------------------- | ------------------------ |
+| `ApiRateLimitError`   | HTTP 429, or a known-exhausted quota (no request made) | `retryAfterMs`, `endpoint`                | 503 + `Retry-After`      |
+| `ApiUnavailableError` | network / timeout / HTTP 5xx / auth rejected (401/403) | `cause`, `status`, `endpoint`, `attempts` | 503                      |
+| `ApiParseError`       | HTTP 200 but the body shape isn't what we expect       | `endpoint`, `issues` (Zod `flatten()`)    | 502                      |
+
+**Retry / rate-limit behavior:**
+
+| Concern             | Behavior                                                                                   |
+| ------------------- | ---------------------------------------------------------------------------------------- |
+| Backoff             | full jitter — `delay = random(0, baseDelayMs * 2 ** attempt)`, capped at `maxDelayMs` (5000) |
+| Attempts            | `CRICKET_API_MAX_RETRIES` *total* tries (default 3); terminal error carries `attempts`     |
+| What retries        | network errors, timeouts, HTTP 5xx, HTTP 429 — nothing else                                |
+| What never retries  | HTTP 4xx ≠ 429 (401/403/404/400) — a bad key won't fix itself by waiting                   |
+| `Retry-After`       | honoured (delta-seconds or HTTP-date) on a 429, used instead of the computed backoff       |
+| Quota headers       | `X-RateLimit-*` / CricAPI `info.hitsToday`/`hitsLimit` read; at 0, next call fails fast    |
+| Min spacing         | `CRICKET_API_MIN_INTERVAL_MS` (default 1000) between outbound calls; set `0` to disable    |
+| Per-attempt timeout | `AbortController` at `CRICKET_API_TIMEOUT_MS` (default 8000) → clean abort, not a hang     |
+| Logging             | start `debug`, success `info`, each retry `warn`, terminal failure `error` — via `logger`  |
+
+A circuit breaker / provider-health endpoint is a **TODO**, deliberately not
+built in this phase.
+
+Config lives in `.env` (see `.env.example`): `CRICKET_API_KEY`,
+`CRICKET_API_BASE_URL`, `CRICKET_API_TIMEOUT_MS`, `CRICKET_API_MAX_RETRIES`,
+`CRICKET_API_MIN_INTERVAL_MS`. `CRICKET_MOCK_FAIL` (`<kind>[:<mode>[:<n>]]`,
+kind = `timeout|429|500|malformed`, mode = `once|always|everyNth`) forces the
+mock provider to fail — how the resilience paths are demoed without a real key.
 
 ## Follows & Matches — manual verification
 

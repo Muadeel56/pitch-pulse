@@ -1,6 +1,11 @@
 import { ZodError } from 'zod';
 import { Prisma } from '@prisma/client';
-import { NotFoundError } from '../errors.js';
+import {
+  NotFoundError,
+  ApiParseError,
+  ApiRateLimitError,
+  ApiUnavailableError,
+} from '../errors.js';
 import { logger } from '../utils/logger.js';
 
 // Centralized fallback for every uncaught error — Zod validation failures,
@@ -8,6 +13,11 @@ import { logger } from '../utils/logger.js';
 // route handler. Route handlers that already build their own response
 // (auth.js's 401s/409s, authenticate.js's 401s) never throw, so they're
 // unaffected: this only fires when a handler *throws*.
+//
+// The cricket API client's typed errors (ApiParseError / ApiRateLimitError /
+// ApiUnavailableError) reach here only when a route calls the client directly
+// (GET /matches/*). Phase 4's polling job catches them itself and keeps going,
+// so it never reaches this handler.
 //
 // Called directly (not via fastify.register), same pattern as
 // authenticatePlugin, so it's unambiguously registered on the root instance
@@ -33,6 +43,24 @@ export default async function errorHandlerPlugin(fastify) {
     if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
       return reply.code(409).send({
         error: { message: 'Already following this resource', code: 'ALREADY_FOLLOWING' },
+      });
+    }
+
+    // Upstream data-provider failures — degrade cleanly instead of a raw 500.
+    if (err instanceof ApiParseError) {
+      logger.error(`Upstream parse error on ${request.method} ${request.url}: ${err.message}`);
+      return reply.code(502).send({
+        error: { message: 'Upstream data provider returned an unexpected response', code: 'BAD_GATEWAY' },
+      });
+    }
+
+    if (err instanceof ApiRateLimitError || err instanceof ApiUnavailableError) {
+      logger.error(`Upstream unavailable on ${request.method} ${request.url}: ${err.name}: ${err.message}`);
+      if (err instanceof ApiRateLimitError && err.retryAfterMs) {
+        reply.header('Retry-After', Math.ceil(err.retryAfterMs / 1000));
+      }
+      return reply.code(503).send({
+        error: { message: 'Upstream data provider is temporarily unavailable', code: 'SERVICE_UNAVAILABLE' },
       });
     }
 

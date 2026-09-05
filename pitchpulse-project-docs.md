@@ -1,9 +1,10 @@
 # PitchPulse — Project Build Docs
 
-**Goal:** Master real-world Node.js backend patterns — REST APIs, background jobs, caching, real-time communication, and event-driven architecture — by building a live cricket score tracker that polls external data, caches it, pushes updates in real time, and notifies users about things they follow.
+**Goal:** Master real-world Node.js backend patterns — REST APIs, background jobs, caching, real-time communication, and event-driven architecture — by building a live cricket score tracker that polls external data, caches it, pushes updates in real time, and notifies users about things they follow. **A React frontend is built alongside the backend, phase by phase, learning React from first principles — no framework magic, tools added only when the problem they solve is actually felt.**
 
-**Estimated time:** 7–10 focused days (bigger than Repo Radar — this is a "pro-level" project)
-**Tech stack:** Fastify, Prisma, PostgreSQL, Redis, BullMQ, Socket.io (or `ws`), Zod, JWT, Docker Compose
+**Estimated time:** 7–10 focused days for the backend, plus ~5–7 more if you build the full frontend track (they interleave — see "Frontend Track" below)
+**Backend stack:** Fastify, Prisma, PostgreSQL, Redis, BullMQ, Socket.io (or `ws`), Zod, JWT, Docker Compose
+**Frontend stack:** React + Vite (plain JavaScript first), `fetch` → TanStack Query, react-router, socket.io-client, plain CSS / CSS Modules. Deliberately **no** Next.js, Redux, TypeScript, Tailwind, or UI kit at the start — each is introduced later, only when you've hit the wall it exists for.
 
 ---
 
@@ -22,7 +23,7 @@
 ### Folder structure
 ```
 pitchpulse/
-├── src/
+├── src/                         # backend (Fastify)
 │   ├── server.js
 │   ├── routes/
 │   │   ├── auth.js
@@ -42,6 +43,17 @@ pitchpulse/
 │   │   └── (zod schemas per route)
 │   └── utils/
 │       └── logger.js
+├── client/                      # frontend (React + Vite) — added in the Frontend Track
+│   ├── src/
+│   │   ├── main.jsx
+│   │   ├── App.jsx
+│   │   ├── api/          client.js — the ONLY place that calls fetch
+│   │   ├── auth/         AuthProvider.jsx, useAuth.js
+│   │   ├── components/   MatchCard.jsx, ...
+│   │   ├── pages/        MatchesPage.jsx, MatchDetailPage.jsx, LoginPage.jsx, ...
+│   │   └── hooks/        useMatchSocket.js, ...
+│   ├── index.html
+│   └── package.json
 ├── prisma/
 │   └── schema.prisma
 ├── docker-compose.yml
@@ -49,6 +61,8 @@ pitchpulse/
 ├── package.json
 └── README.md
 ```
+
+The backend runs on `:3000`, the Vite dev server on `:5173`. Configure Vite's dev proxy so `/auth`, `/matches`, `/follows` requests forward to `:3000` during development, and add `@fastify/cors` to the backend (Frontend Phase A) for when they run on separate origins.
 
 ### Todos
 - [ ] Cricket API key obtained and tested manually
@@ -96,6 +110,8 @@ pitchpulse/
 - [ ] Centralized error handler (Fastify `setErrorHandler`) so all routes return consistent `{ error: { message, code } }` shape
 
 **Checkpoint:** Full follow/unfollow flow works, live matches endpoint returns real (or mocked) data.
+
+> **Frontend hook-in:** the endpoints from this phase are exactly what **Frontend Phase A** consumes. Once this checkpoint passes, you can start the React app against a real, stable API — no need to wait for the later backend phases.
 
 ---
 
@@ -238,7 +254,170 @@ Go back through the entire system end-to-end.
 - [ ] Add pagination to `/notifications` and `/matches/live` if lists get long
 - [ ] Structured logging with `pino` instead of `console.log` everywhere
 - [ ] Basic tests with Vitest + `supertest` (or Fastify's built-in `inject`) for at least the auth and follows routes
-- [ ] Swap the minimal HTML test client for a tiny React page (quick win given your frontend background) showing live scores updating in real time — this makes the project demo-able and genuinely satisfying to show off
+- [ ] Swap the minimal HTML test client for the full React app (see the **Frontend Track** below) showing live scores updating in real time — this makes the project demo-able and genuinely satisfying to show off
+
+---
+
+## Frontend Track (React) — learn React from first principles
+
+Built **alongside** the backend, not after it. Each frontend phase pairs with a backend phase and consumes what that phase produced. Same format as above: Steps, Todos, Checkpoint.
+
+**The one rule: feel the pain before you reach for the library.** Every tool below (router, TanStack Query, Context, TypeScript) is introduced at the exact point you've already hit the problem it solves by hand. If you adopt it earlier, it's just magic you can't reason about.
+
+**Start with — and ONLY with:** Vite + React, plain JavaScript (no TS), `fetch` (no axios/no data lib), `useState` + `useEffect` (no state manager), plain CSS or CSS Modules (no Tailwind, no component kit).
+
+**Add later, when it hurts:** react-router → TanStack Query → Context → a WebSocket custom hook → (optionally) TypeScript → (optionally) Tailwind.
+
+---
+
+### Frontend Phase A — React fundamentals
+
+*Pairs with backend Phase 2 (already done — auth, follows, matches endpoints are live).*
+
+#### Steps
+1. `npm create vite@latest client -- --template react` (JavaScript, not TS). Delete the boilerplate CSS/logo noise.
+2. Configure `vite.config.js` dev proxy: `/auth`, `/matches`, `/follows` → `http://localhost:3000`.
+3. Add `@fastify/cors` to the backend, allowing the Vite origin — needed once frontend and backend are served separately.
+4. Build a **static** matches list first (hardcoded array → `.map()` → `<MatchCard>`), THEN make it real with `fetch` in `useEffect`.
+5. Write the loading / error / empty / data branches by hand. This boilerplate is exactly what TanStack Query deletes for you later — you need to have written it once.
+6. Build login + signup forms as **controlled inputs**; store the returned JWT in `useState`, then persist to `localStorage`.
+
+#### Todos
+- [ ] `client/` scaffolded with Vite, dev proxy working, `@fastify/cors` on the backend
+- [ ] `<MatchCard>` component — props only, no state
+- [ ] `MatchesPage` — `fetch('/matches/live')` in `useEffect`, handles loading/error/empty/data
+- [ ] Correct `key` on the mapped list (understand why index-as-key is a trap)
+- [ ] `LoginPage` / `SignupPage` — controlled forms, submit to `POST /auth/login` & `/auth/signup`
+- [ ] JWT stored in state + `localStorage`; render differs when logged in vs out (conditional rendering)
+- [ ] Backend errors (`{ error: { message, code } }`) surfaced in the form UI
+- [ ] Effect cleanup / ignore-flag so a fast unmount doesn't set state on a dead component (you'll see React's StrictMode double-invoke in dev — that's the lesson, not a bug)
+
+**Core concepts locked in:** components, props vs state, JSX, event handlers, `useEffect` + dependency array + cleanup, conditional & list rendering, lifting state up.
+
+**Checkpoint:** You can open the React app, see real matches from the backend, sign up, log in, and the UI changes based on auth state. Every fetch state (loading, error, empty) is visibly handled — no blank screens, no uncaught promise rejections in the console.
+
+---
+
+### Frontend Phase B — Routing & auth context
+
+*Pairs with backend Phase 3 (external API client). Mirror on the frontend: wrap all backend calls in one `client/src/api/client.js` — never call `fetch` from a component, just like the backend never calls `fetch` from a route.*
+
+#### Steps
+1. Add **react-router**. Routes: `/login`, `/signup`, `/matches`, `/matches/:id`, `/follows`.
+2. Build a `<ProtectedRoute>` that redirects to `/login` when there's no token.
+3. You've now prop-drilled `token` through several layers and it hurts — **that's why** you now lift it into a `<AuthProvider>` using `useContext`. Expose a `useAuth()` custom hook (`{ user, token, login, logout }`).
+4. `api/client.js` reads the token and attaches `Authorization: Bearer <token>`; on `401` it triggers `logout()`. It throws typed errors mirroring the backend's error codes.
+
+#### Todos
+- [ ] react-router installed; nested layout route with a shared `<NavBar>`
+- [ ] `useParams` drives `MatchDetailPage` (`/matches/:id` → `GET /matches/:id`, handle 404 → "Match not found" UI)
+- [ ] `useNavigate` for post-login redirect
+- [ ] `<ProtectedRoute>` wrapping `/matches`, `/matches/:id`, `/follows`
+- [ ] `AuthProvider` + `useAuth()` custom hook; token drilling removed
+- [ ] `api/client.js` — single module, attaches auth header, centralizes base URL + error parsing
+- [ ] Follow / unfollow buttons on team/player views calling `POST`/`DELETE /follows/...`
+- [ ] `/follows` page listing the current user's followed teams & players (`GET /follows`)
+
+**Core concepts locked in:** client-side routing, route params, protected routes, layouts; `useContext`; custom hooks; why prop drilling is a smell and Context is the fix.
+
+**Checkpoint:** Deep-linking to `/matches/2` works on a page refresh. Hitting a protected route while logged out bounces you to `/login` and back after login. No component receives `token` as a prop anymore.
+
+---
+
+### Frontend Phase C — Server state done right (TanStack Query)
+
+*Pairs with backend Phases 4–5 (background polling + Redis cache). The backend now serves cached data fast and refreshes it on a timer — the frontend should reflect that freshness without you wiring refetch logic by hand.*
+
+#### Steps
+1. You've hand-written `useEffect` + `useState` fetching 4+ times now. Install **`@tanstack/react-query`** — you'll immediately recognize everything it gives you as boilerplate you already wrote.
+2. Convert reads to `useQuery` (query keys: `['matches','live']`, `['matches', id]`, `['follows']`).
+3. Convert follow/unfollow to `useMutation` with **optimistic updates** and `invalidateQueries` on settle.
+4. Set a `refetchInterval` on the live matches query roughly matching the backend poll cadence, and/or `refetchOnWindowFocus`.
+
+#### Todos
+- [ ] `QueryClientProvider` at the app root
+- [ ] All GETs migrated to `useQuery`; manual loading/error state deleted
+- [ ] `useMutation` for follow/unfollow, optimistic update + rollback on error + invalidate on settle
+- [ ] `refetchInterval` on `['matches','live']`
+- [ ] React Query Devtools wired in dev
+- [ ] A visible "updated Xs ago" indicator driven by `dataUpdatedAt`
+
+**Core concepts locked in:** the distinction between **server state and client (UI) state**; query keys & cache invalidation; mutations; optimistic UI; staleness vs cache time.
+
+**Checkpoint:** Follow a team — the button flips instantly (optimistic), and reverts cleanly if the request fails. The live matches list visibly refreshes on its own. You deleted more code than you added.
+
+---
+
+### Frontend Phase D — Real-time (WebSockets)
+
+*Pairs with backend Phase 6 (Socket.io). The polling job emits `matchUpdated`; the server broadcasts `scoreUpdate` to a room per match.*
+
+#### Steps
+1. `npm i socket.io-client`.
+2. Build a `useMatchSocket(matchId)` custom hook: connect on mount, `socket.emit('join-match', matchId)`, subscribe to `scoreUpdate`, and **clean up fully** on unmount / when `matchId` changes.
+3. On a `scoreUpdate`, update the React Query cache directly (`queryClient.setQueryData(['matches', id], ...)`) instead of refetching — the socket IS the fresh data.
+4. Store the socket instance in a `useRef` (it's not render state).
+
+#### Todos
+- [ ] `useMatchSocket(matchId)` hook — connect / join / listen / cleanup, no dangling listeners
+- [ ] Socket instance held in `useRef`, not `useState`
+- [ ] `scoreUpdate` payload written into the Query cache via `setQueryData`
+- [ ] Connection status indicator (connecting / live / reconnecting)
+- [ ] Leaves the match room on unmount; reconnect handling doesn't double-subscribe
+- [ ] Watch out for **stale closures** in the socket handler — the classic React real-time bug
+
+**Core concepts locked in:** `useRef` for mutable non-render values; effect cleanup for real; custom hooks that encapsulate a side-effecting resource; stale-closure pitfalls.
+
+**Checkpoint:** Open two browser tabs on the same match. Trigger a score change on the backend (or wait for the mock generator). Both tabs update within seconds, no refresh, and the Network tab shows **no polling** — the update arrived over the socket.
+
+---
+
+### Frontend Phase E — Notifications & polish
+
+*Pairs with backend Phases 7 & 10 (event-driven notifications + polish).*
+
+#### Steps
+1. Notifications bell in the navbar: `GET /notifications` via `useQuery` (or push over the socket if the backend supports it), unread badge count.
+2. Mark-as-read `useMutation`.
+3. Polish pass: loading **skeletons** (not spinners), an `<ErrorBoundary>` around each route, real empty states, pagination on long lists.
+4. Add `React.memo` / `useMemo` / `useCallback` **only where React Devtools Profiler shows a real wasted render** — learn them, don't cargo-cult them.
+5. Optional: convert `client/` to **TypeScript** now that the data shapes are stable — type the API client responses first.
+
+#### Todos
+- [ ] Notifications page + navbar bell with unread count
+- [ ] Mark-as-read mutation with cache update
+- [ ] `<ErrorBoundary>` per route; a global fallback UI
+- [ ] Loading skeletons for `MatchesPage` and `NotificationsPage`
+- [ ] Pagination or infinite scroll on `/notifications` and `/matches/live` (matches backend Phase 10 pagination)
+- [ ] Profiler-verified memoization only where it measurably helps
+- [ ] (Optional) TypeScript migration, starting from `api/client.js`
+- [ ] (Optional) extract a tiny design-token CSS file; Tailwind only if you actively want it
+
+**Core concepts locked in:** error boundaries; perceived-performance patterns; when NOT to memoize; (optionally) typing an API boundary.
+
+**Checkpoint:** Follow a team, trigger a match event involving them on the backend, and a notification appears in the bell without a manual refresh. Every route survives a thrown error with a friendly fallback instead of a white screen.
+
+---
+
+### React mastery checklist (tick as you go)
+
+- [ ] Components, props, composition via `children`
+- [ ] `useState` — immutable updates, updater functions
+- [ ] `useEffect` — dependency array, cleanup, StrictMode double-invoke
+- [ ] Lists, keys, why index-as-key bites
+- [ ] Controlled forms
+- [ ] Lifting state up vs prop drilling
+- [ ] `useContext` + custom hooks
+- [ ] `useReducer` for complex local state
+- [ ] `useRef` — DOM refs AND mutable non-render values
+- [ ] Routing: params, navigation, protected routes, nested layouts
+- [ ] Server state vs client state
+- [ ] Data fetching: loading/error/success, race conditions, cleanup
+- [ ] Mutations + optimistic updates + cache invalidation
+- [ ] Memoization — and when not to
+- [ ] Error boundaries
+- [ ] WebSocket integration via a custom hook
+- [ ] Stale-closure debugging
 
 ---
 
@@ -251,6 +430,7 @@ A fully running stack (via `docker compose up`) where:
 4. Score changes push instantly to connected clients via WebSocket, no polling from the frontend
 5. Followed-team/player events generate retrievable notifications
 6. The entire system survives external API failures, Redis drops, and bad input without crashing
+7. **A React frontend (in `client/`) covers the full flow: sign up / log in, browse & follow, and watch a match page update live over a WebSocket with no polling — every route handles loading, empty, and error states without a blank screen**
 
 ---
 
@@ -262,3 +442,12 @@ A fully running stack (via `docker compose up`) where:
 - Real-time bidirectional communication — a genuine strength of Node over typical Django setups
 - Event-driven design with `EventEmitter` — decoupling "something happened" from "here's what to do about it"
 - How all of Repo Radar's lessons (retry, backoff, error handling) apply just as much in a persistent server as they did in a CLI tool
+
+### On the frontend side
+
+- React's core model: components, props vs state, one-way data flow, and why re-renders happen
+- The `useEffect` lifecycle for real — dependencies, cleanup, and the classes of bug that come from getting it wrong
+- The difference between **server state** and **client/UI state**, and why a data library (TanStack Query) exists
+- Client-side routing, protected routes, and sharing cross-cutting state with Context instead of prop drilling
+- Consuming a real-time WebSocket feed from React without leaks or stale closures
+- Why the "feel the pain first" approach makes each added tool (router, query lib, Context, TS) something you can actually reason about
