@@ -1,0 +1,149 @@
+# PitchPulse
+
+A live cricket score tracker built to learn real-world Node.js backend
+patterns — REST APIs, background jobs, caching, WebSockets, and event-driven
+architecture. See [`pitchpulse-project-docs.md`](./pitchpulse-project-docs.md)
+for the full 10-phase build plan, and [`issues/`](./issues) for the phase-by-phase
+issue breakdown.
+
+This README currently covers **Phase 0 (Setup)** and **Phase 1 (Database
+Schema & Auth)**.
+
+## Cricket data source decision
+
+We evaluated [CricAPI](https://cricapi.com/) and
+[Cricket Data API](https://cricketdata.org/). Both require signup and issue
+rate-limited API keys, and at this stage of the project we haven't registered
+for and validated a live key against real network access.
+
+Per the project docs' explicit fallback clause, we're deferring live API
+integration for now and will implement a **mock data generator** (random
+score increments every few seconds) as the data source for Phase 3/4. This
+still teaches 100% of the Node concepts the project is after — background
+polling, diffing, caching, real-time push — without live-API access blocking
+progress.
+
+`src/lib/cricketApiClient.js` stays a stub in this phase. Phase 3 will
+implement it against either a real free-tier key (if one is obtained and
+manually curl-verified at that time) or the mock generator, whichever proves
+viable. `CRICKET_API_KEY` is present in `.env.example` for forward
+compatibility but unused until then.
+
+## Project structure
+
+```
+pitch-pulse/
+├── src/
+│   ├── server.js            # Fastify app entrypoint
+│   ├── routes/
+│   │   ├── auth.js          # signup / login / me
+│   │   ├── matches.js       # stub — Phase 2
+│   │   └── follows.js       # stub — Phase 2
+│   ├── plugins/
+│   │   └── authenticate.js  # JWT auth hook (fastify.authenticate)
+│   ├── jobs/
+│   │   └── pollScores.js    # stub — Phase 4
+│   ├── realtime/
+│   │   └── socket.js        # stub — Phase 6
+│   ├── events/
+│   │   └── notifier.js      # stub — Phase 7
+│   ├── cache/
+│   │   └── redisClient.js   # ioredis client
+│   ├── lib/
+│   │   ├── prisma.js        # PrismaClient singleton
+│   │   └── cricketApiClient.js # stub — Phase 3
+│   ├── schemas/
+│   │   └── auth.js          # zod schemas
+│   └── utils/
+│       └── logger.js        # leveled console logger
+├── prisma/
+│   └── schema.prisma
+├── docker-compose.yml
+├── .env.example
+└── package.json
+```
+
+## Setup
+
+1. Install dependencies:
+   ```bash
+   npm install
+   ```
+2. Copy the env template and adjust if needed:
+   ```bash
+   cp .env.example .env
+   ```
+   (`JWT_SECRET` should be a long random string in real use — see below.)
+3. Start Postgres and Redis:
+   ```bash
+   docker compose up -d
+   ```
+   > **Note:** Postgres is mapped to host port **5434** (not the default 5432)
+   > to avoid clashing with any other local Postgres instance. `DATABASE_URL`
+   > in `.env.example` already reflects this.
+4. Run the initial migration:
+   ```bash
+   npx prisma migrate dev --name init
+   ```
+5. Start the dev server (auto-restarts on file changes via `node --watch`):
+   ```bash
+   npm run dev
+   ```
+
+## Docker Compose usage
+
+- `docker compose up -d` — start Postgres + Redis in the background
+- `docker compose ps` — check container/health status
+- `docker compose logs -f postgres` / `redis` — tail logs
+- `docker compose down` — stop and remove containers (data persists in named volumes)
+- `docker compose down -v` — stop and also wipe the volumes (fresh DB/cache)
+
+Only `postgres` and `redis` are containerized for now — the Node app runs
+locally against them. Dockerizing the app itself is Phase 9.
+
+## Prisma workflow
+
+- `npm run prisma:migrate` — create/apply a migration in dev
+- `npm run prisma:generate` — regenerate the Prisma client after schema changes
+- `npm run prisma:studio` — open Prisma Studio to browse data
+
+Match data is **not** modeled in Postgres — it's transient/live and lives in
+Redis instead (see Phase 5). Postgres only holds `User`, `Team`, `Player`,
+and the `FollowedTeam` / `FollowedPlayer` join tables.
+
+## Auth — manual verification
+
+With the server running (`npm run dev`) and Postgres/Redis up:
+
+```bash
+# Signup — expect 201, body has id/email/createdAt, no password field
+curl -i -X POST http://localhost:3000/auth/signup \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"test@example.com","password":"password123"}'
+
+# Duplicate signup — expect 409 EMAIL_TAKEN
+curl -i -X POST http://localhost:3000/auth/signup \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"test@example.com","password":"password123"}'
+
+# Login — expect 200 with { "token": "..." }
+curl -i -X POST http://localhost:3000/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"test@example.com","password":"password123"}'
+
+# Wrong password — expect 401 INVALID_CREDENTIALS
+curl -i -X POST http://localhost:3000/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"test@example.com","password":"wrongpass"}'
+
+# GET /me with a valid token — expect 200 with { id, email }
+curl -i http://localhost:3000/me -H "Authorization: Bearer <token from login>"
+
+# GET /me with no token — expect a clean 401, not a stack trace
+curl -i http://localhost:3000/me
+
+# GET /me with a garbage token — expect a clean 401, not a 500
+curl -i http://localhost:3000/me -H "Authorization: Bearer garbage.token.value"
+```
+
+All error responses use a consistent shape: `{ "error": { "message": "...", "code": "..." } }`.

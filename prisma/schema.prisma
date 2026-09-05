@@ -1,0 +1,59 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id              String           @id @default(uuid())
+  email           String           @unique
+  passwordHash    String
+  createdAt       DateTime         @default(now())
+  followedTeams   FollowedTeam[]
+  followedPlayers FollowedPlayer[]
+}
+
+model Team {
+  id        String         @id @default(uuid())
+  name      String
+  shortName String
+  createdAt DateTime       @default(now())
+  players   Player[]
+  followers FollowedTeam[]
+}
+
+model Player {
+  id        String           @id @default(uuid())
+  name      String
+  teamId    String?
+  team      Team?            @relation(fields: [teamId], references: [id])
+  createdAt DateTime         @default(now())
+  followers FollowedPlayer[]
+}
+
+// Join table — a user can't follow the same team twice.
+model FollowedTeam {
+  id        String   @id @default(uuid())
+  userId    String
+  teamId    String
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  team      Team     @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, teamId])
+}
+
+// Join table — a user can't follow the same player twice.
+model FollowedPlayer {
+  id        String   @id @default(uuid())
+  userId    String
+  playerId  String
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  player    Player   @relation(fields: [playerId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, playerId])
+}

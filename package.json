@@ -1,0 +1,33 @@
+{
+  "name": "pitch-pulse",
+  "version": "1.0.0",
+  "description": "Live cricket score tracker — REST API, background jobs, caching, WebSockets, and event-driven notifications.",
+  "main": "src/server.js",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:generate": "prisma generate",
+    "prisma:studio": "prisma studio",
+    "test": "vitest run"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@prisma/client": "^6.19.3",
+    "bcrypt": "^6.0.0",
+    "bullmq": "^6.3.4",
+    "dotenv": "^17.4.2",
+    "fastify": "^5.12.3",
+    "ioredis": "^6.0.0",
+    "jsonwebtoken": "^9.0.3",
+    "prisma": "^6.19.3",
+    "socket.io": "^4.8.3",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.11"
+  }
+}
