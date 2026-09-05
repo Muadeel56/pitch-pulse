@@ -8,8 +8,9 @@ issue breakdown.
 
 This README currently covers **Phase 0 (Setup)**, **Phase 1 (Database
 Schema & Auth)**, **Phase 2 (Core REST Endpoints — Follows + Match
-Listing)**, **Phase 3 (External API client)**, and **Phase 4 (Background
-polling job)**.
+Listing)**, **Phase 3 (External API client)**, **Phase 4 (Background
+polling job)**, **Phase 5 (Caching layer)**, and **Phase 6 (Real-time
+push — WebSockets)**.
 
 ## Cricket data source decision
 
@@ -210,8 +211,10 @@ mock provider to fail — how the resilience paths are demoed without a real key
 (Redis-backed) fires every `POLL_INTERVAL_MS` (default 45s, clamped 30–60s),
 calls `getLiveMatches()`, diffs the result against the last snapshot, and — only
 when something meaningful changed — writes the new snapshot and emits
-`matchUpdated` on the shared `notifier` (`src/events/notifier.js`; real listeners
-arrive in Phase 7). Start the app with no traffic and `info` logs show
+`matchUpdated` on the shared `notifier` (`src/events/notifier.js`; the Phase 6
+socket bridge listens, and more listeners arrive in Phase 7). It also warms the
+`match:*` read cache on every poll — see [Caching layer](#caching-layer). Start
+the app with no traffic and `info` logs show
 `poll #N: X matches, Y changed` on their own, continuously.
 
 `startPolling()` runs from `src/server.js` after `fastify.listen`; if the queue
@@ -219,15 +222,20 @@ can't reach Redis the process exits non-zero (same stance as a failed Postgres
 connect). `stopPolling()` runs from `shutdown()` before Prisma disconnects —
 worker → queueEvents → queue → dedicated Redis connections, with a 10s hard
 timeout so a wedged job can't block Ctrl-C. BullMQ gets its **own** ioredis
-connections (`maxRetriesPerRequest: null`); the shared `redisClient` is used only
-for the `poll:*` keys below.
+connections (`maxRetriesPerRequest: null`); the shared `redisClient` is used for
+the `poll:*` keys below and (Phase 5) the `match:*` read cache.
 
-**Redis keys** (all namespaced `poll:*` — Phase 5's caching layer must not collide):
+**Redis keys.** The `poll:*` namespace is the job's private working state; the
+`match:*` namespace is the Phase 5 read cache, written by this same job (see
+[Caching layer](#caching-layer)) and read by the routes. Kept disjoint so the two
+concerns stay debuggable in isolation. After Phases 4–5 Redis holds exactly:
 
-| Key             | Shape                                                        | Notes                                                                 |
-| --------------- | ---------------------------------------------------------- | ------------------------------------------------------------------- |
-| `poll:snapshot` | `{ "polledAt": <ISO string>, "matches": Match[] }` (JSON) | the last normalized poll result; written *before* the emit, skipped entirely on a no-change poll |
-| `poll:lock`     | opaque token string, `SET NX PX POLL_LOCK_TTL_MS`         | guards the critical section across processes / a resumed stuck job; released only if the token still matches (Lua `get`+`del`, never a blind `DEL`) |
+| Key                  | Shape                                                     | Notes                                                                 |
+| -------------------- | ------------------------------------------------------- | ------------------------------------------------------------------- |
+| `poll:snapshot`      | `{ "polledAt": <ISO string>, "matches": Match[] }` (JSON) | the last normalized poll result; written *before* the emit, skipped entirely on a no-change poll |
+| `poll:lock`          | opaque token string, `SET NX PX POLL_LOCK_TTL_MS`         | guards the critical section across processes / a resumed stuck job; released only if the token still matches (Lua `get`+`del`, never a blind `DEL`) |
+| `match:live:list`    | `Match[]` (JSON), `EX CACHE_TTL_SECONDS`                  | the `GET /matches/live` payload; **written only by the poll job**, every poll (including the first) |
+| `match:detail:{id}`  | one `Match` (JSON), `EX CACHE_TTL_SECONDS`                | the `GET /matches/:id` payload; one key per match in the live list, same writer/cadence |
 
 **`matchUpdated` event payload:** `{ polledAt, matches, changes }` where
 `matches` is the full new `Match[]` and `changes` is:
@@ -269,6 +277,76 @@ tests), `POLL_INTERVAL_MS`, `POLL_LOCK_TTL_MS`. Multi-process worker scaling, a
 Bull Board dashboard, and a provider circuit breaker are **TODOs**, deliberately
 not built in this phase.
 
+## Caching layer
+
+**The poll job is the only writer of fresh match data into Redis; the HTTP layer
+is read-only against it.** After each successful poll `runPollOnce()` writes
+`match:live:list` + one `match:detail:{id}` per match (order: snapshot → cache →
+emit — the cache write is wrapped so it can't throw past the emit and skip
+listeners; a write blip is one `logger.warn` and is swallowed). It writes on
+*every* poll, including the first-run seed and no-change polls, so the cache
+stays continuously warm while the job runs.
+
+`GET /matches/live` and `GET /matches/:id` read that cache and return it
+directly. On a **cold miss** — a brand-new process before its first poll, or a
+wiped Redis — the route logs a `warn`, falls back to `cricketApiClient` **once**,
+re-warms the key, and returns. `getMatchDetail`'s `NotFoundError` still maps to
+404 and a not-found is never cached. A cold miss is rare by design; there is no
+stampede / single-flight protection on that branch (a TODO).
+
+`src/cache/redisClient.js` exports the JSON helpers used by both sides:
+`cacheGet(key)` (→ `null` on miss *and* on corrupt JSON, which it `warn`s),
+`cacheSet(key, value, ttlSeconds)` (throws unless `ttlSeconds` is a positive
+number — there is no "cache forever"), `cacheDel(key)`, plus `CACHE_KEYS` and
+`cacheTtlSeconds()`.
+
+`CACHE_TTL_SECONDS` (`.env`, default `120`, clamped to a `30`s floor) is a safety
+net so a stalled job can't serve infinitely stale data silently. `startPolling()`
+logs a `warn` at boot if it isn't comfortably larger than `POLL_INTERVAL_MS`.
+
+**Check it:** `docker compose up -d`, `npm run dev`. `FLUSHALL` then
+`curl /matches/live` → one `cache miss … direct API fallback` line, slower
+response; the next request logs nothing and is near-instant. After a poll cycle
+`redis-cli KEYS 'match:*'` shows the list + detail keys, each `TTL` in
+`(0, 120]`. With `POLL_ENABLED=false` the API keeps serving from the warm cache
+until the TTL expires, then falls back once and re-warms — it never 5xxs just
+because the job is down.
+
+## Real-time push (WebSockets)
+
+`src/realtime/socket.js` runs a **Socket.io 4.x** server on Fastify's underlying
+`http.Server` (`initSocket(fastify.server)`, attached in `server.js` *after*
+`fastify.listen()` and *before* `startPolling()`; `closeSocket()` runs from
+`shutdown()` before `stopPolling()` so a late emit finds no listener rather than
+a half-closed `io`). Exports: `initSocket` / `getIO` / `closeSocket`
+(idempotent).
+
+Clients emit `join-match` with a match id (validated: non-empty, ≤ 64 chars) to
+join the `match:{id}` room and get a `joined` confirmation (ack + event);
+`leave-match` leaves. Disconnect does nothing by hand — **Socket.io removes a
+disconnected socket from all its rooms automatically**, and there is no
+hand-rolled room registry to leak.
+
+One `notifier.on('matchUpdated')` listener bridges the poll job to the sockets:
+for each entry in `changes[]` it emits a `scoreUpdate`
+(`{ id, type, match: change.after, fields, polledAt }`) to that one `match:{id}`
+room — never the whole list to every room. A malformed `change` is logged and
+skipped; the listener survives. Phase 7 will hang more listeners off the same
+`notifier` — it is never `removeAllListeners()`'d.
+
+`SOCKET_CORS_ORIGIN` (`.env`, default `*`) sets the handshake CORS origin. **TODO
+before any real deployment:** authenticate the handshake, rate-limit
+`join-match`, lock CORS down off `*`, and add the Socket.io Redis adapter for
+multi-process broadcast (single process only here).
+
+**Diagnostic client:** `GET /client` serves `public/match-client.html` (a one-off
+inline route — one static file doesn't justify `@fastify/static`). It loads the
+client from the server's own `/socket.io/socket.io.js`, lets you join a match id,
+and logs connection events, `joined`, and every `scoreUpdate` to the page. Open
+it in two tabs on the same match id (from `/matches/live`; set
+`POLL_INTERVAL_MS=30000` for speed) and both update within seconds of a poll
+change, no refresh; a tab on a different match gets nothing.
+
 ## Follows & Matches — manual verification
 
 **Design decisions:**
@@ -279,8 +357,9 @@ not built in this phase.
   return **404 `NOT_FOUND`** if the user isn't currently following that
   resource, rather than silently succeeding — this is a deliberate,
   non-idempotent choice so callers get explicit feedback on a no-op delete.
-- `/matches/*` is backed by a small fixed set of **mock** matches
-  (`src/lib/mockMatches.js`) — real cricket API integration is Phase 3.
+- `/matches/*` reads from the Redis cache the poll job keeps warm (Phase 5),
+  falling back to `cricketApiClient` only on a cold miss. See
+  [Caching layer](#caching-layer).
 
 With the server running (`npm run dev`), Postgres/Redis up, and
 `npx prisma db seed` already run:

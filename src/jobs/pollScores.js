@@ -35,7 +35,7 @@ import { randomUUID } from 'node:crypto';
 import Redis from 'ioredis';
 import { Queue, Worker, QueueEvents, UnrecoverableError } from 'bullmq';
 
-import { redisClient } from '../cache/redisClient.js';
+import { redisClient, cacheSet, cacheTtlSeconds, CACHE_KEYS } from '../cache/redisClient.js';
 import { notifier } from '../events/notifier.js';
 import { getLiveMatches } from '../lib/cricketApiClient.js';
 import { sleep } from '../lib/retry.js';
@@ -184,6 +184,20 @@ export async function runPollOnce({
   const lockKey = `${keyPrefix}${LOCK_SUFFIX}`;
   const token = randomUUID();
 
+  // Phase 5: the job is the ONLY writer of the `match:*` read cache. Written
+  // after the snapshot and before the emit (snapshot → cache → emit). Never
+  // throws — a Redis write blip must not fail the poll or skip the emit.
+  const warmCache = async (list) => {
+    try {
+      const ttl = cacheTtlSeconds();
+      await cacheSet(CACHE_KEYS.liveList, list, ttl);
+      for (const mm of list) await cacheSet(CACHE_KEYS.detail(mm.id), mm, ttl);
+      logger.debug(`poll #${n}: cache write: 1 list + ${list.length} detail keys (ttl ${ttl}s)`);
+    } catch (err) {
+      logger.warn(`poll #${n}: cache write failed (swallowed): ${err.message}`);
+    }
+  };
+
   const locked = await redis.set(lockKey, token, 'PX', lockTtlMs, 'NX');
   if (locked !== 'OK') {
     logger.info(`poll #${n}: skipped (locked)`);
@@ -197,8 +211,11 @@ export async function runPollOnce({
     const raw = await redis.get(snapshotKey);
 
     // First ever run: seed the snapshot and emit nothing (documented choice).
+    // The cache is still warmed — a fresh deploy has a usable cache after one
+    // poll cycle, not only after the first *change*.
     if (!raw) {
       await redis.set(snapshotKey, JSON.stringify({ polledAt: nowIso(), matches }));
+      await warmCache(matches);
       logger.info(`poll #${n}: ${matches.length} matches, first run (snapshot seeded)`);
       return { firstRun: true, changes: [] };
     }
@@ -207,12 +224,16 @@ export async function runPollOnce({
     const changes = diffMatches(prev, matches);
 
     if (changes.length === 0) {
+      // Nothing to emit, but keep the cache warm so its TTL only bites when the
+      // job is actually down/stalled — not during a quiet spell in the match.
+      await warmCache(matches);
       logger.debug(`poll #${n}: ${matches.length} matches, 0 changed`);
       return { changes: [] };
     }
 
     const polledAt = nowIso();
     await redis.set(snapshotKey, JSON.stringify({ polledAt, matches }));
+    await warmCache(matches);
     notifier.emit('matchUpdated', { polledAt, matches, changes });
     logger.info(`poll #${n}: ${matches.length} matches, ${changes.length} changed`);
     return { changes };
@@ -248,6 +269,14 @@ export async function startPolling() {
   if (!enabled) {
     logger.info('polling disabled');
     return;
+  }
+
+  // The cache TTL is a safety net for a stalled job; it must comfortably outlast
+  // one poll interval or a single slow poll would let the cache expire.
+  if (cacheTtlSeconds() * 1000 <= intervalMs) {
+    logger.warn(
+      `CACHE_TTL_SECONDS (${cacheTtlSeconds()}s) is not safely larger than POLL_INTERVAL_MS (${intervalMs}ms) — cache may expire between polls`,
+    );
   }
 
   queue = new Queue(QUEUE_NAME, { connection: makeBullConnection() });

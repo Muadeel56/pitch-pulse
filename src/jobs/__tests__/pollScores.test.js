@@ -3,7 +3,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
 
 import { runPollOnce, pollProcessor, diffMatches, __resetPollState } from '../pollScores.js';
-import { redisClient } from '../../cache/redisClient.js';
+import { redisClient, cacheTtlSeconds, CACHE_KEYS } from '../../cache/redisClient.js';
 import { notifier } from '../../events/notifier.js';
 import { getLiveMatches } from '../../lib/cricketApiClient.js';
 import { ApiParseError, ApiUnavailableError } from '../../errors.js';
@@ -28,11 +28,15 @@ const m = (id, over = {}) => ({
 });
 
 const readSnapshot = async () => JSON.parse((await redisClient.get(SNAP)) ?? 'null');
+const readCache = async (key) => JSON.parse((await redisClient.get(key)) ?? 'null');
+const clearCacheKeys = () =>
+  redisClient.del(CACHE_KEYS.liveList, CACHE_KEYS.detail('x1'), CACHE_KEYS.detail('x2'));
 
 let matchUpdated;
 
 beforeEach(async () => {
   await redisClient.del(SNAP, LOCK, 'poll:snapshot', 'poll:lock');
+  await clearCacheKeys();
   __resetPollState();
   getLiveMatches.mockReset();
   matchUpdated = vi.fn();
@@ -46,6 +50,7 @@ afterEach(async () => {
   notifier.removeListener('matchUpdated', matchUpdated);
   vi.restoreAllMocks();
   await redisClient.del(SNAP, LOCK, 'poll:snapshot', 'poll:lock');
+  await clearCacheKeys();
 });
 
 afterAll(async () => {
@@ -159,6 +164,56 @@ describe('runPollOnce', () => {
 
     expect(res.changes).toEqual([]);
     expect(matchUpdated).not.toHaveBeenCalled();
+  });
+});
+
+describe('runPollOnce — Phase 5 cache writes', () => {
+  it('writes match:live:list + one match:detail:{id} per match with the configured TTL after a change', async () => {
+    getLiveMatches.mockResolvedValueOnce([m('x1')]);
+    await runPollOnce(opts); // first run
+
+    getLiveMatches.mockResolvedValueOnce([m('x1', { score: { A: '40/0', B: '0/0' } }), m('x2')]);
+    await runPollOnce(opts); // change → snapshot + cache + emit
+
+    const list = await readCache(CACHE_KEYS.liveList);
+    expect(list.map((x) => x.id)).toEqual(['x1', 'x2']);
+    expect(await readCache(CACHE_KEYS.detail('x1'))).toMatchObject({ id: 'x1' });
+    expect(await readCache(CACHE_KEYS.detail('x2'))).toMatchObject({ id: 'x2' });
+
+    const pttl = await redisClient.pttl(CACHE_KEYS.liveList);
+    expect(pttl).toBeGreaterThan(0);
+    expect(pttl).toBeLessThanOrEqual(cacheTtlSeconds() * 1000);
+  });
+
+  it('writes the cache on the first run even though no matchUpdated is emitted', async () => {
+    getLiveMatches.mockResolvedValueOnce([m('x1')]);
+
+    const res = await runPollOnce(opts);
+
+    expect(res).toMatchObject({ firstRun: true });
+    expect(matchUpdated).not.toHaveBeenCalled();
+    expect(await readCache(CACHE_KEYS.liveList)).toEqual([m('x1')]);
+    expect(await readCache(CACHE_KEYS.detail('x1'))).toEqual(m('x1'));
+  });
+
+  it('a cacheSet failure does not reject runPollOnce and does not suppress the emit', async () => {
+    getLiveMatches.mockResolvedValueOnce([m('x1')]);
+    await runPollOnce(opts); // seed
+
+    const origSet = redisClient.set.bind(redisClient);
+    vi.spyOn(redisClient, 'set').mockImplementation((key, ...args) =>
+      String(key).startsWith('match:')
+        ? Promise.reject(new Error('redis write blip'))
+        : origSet(key, ...args),
+    );
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    getLiveMatches.mockResolvedValueOnce([m('x1', { score: { A: '99/0', B: '0/0' } })]);
+    const res = await runPollOnce(opts);
+
+    expect(res.changes).toHaveLength(1);
+    expect(matchUpdated).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/cache write failed/));
   });
 });
 

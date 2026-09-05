@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PitchPulse — match client (diagnostic)</title>
+    <style>
+      body {
+        font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        margin: 0;
+        padding: 1.5rem;
+        background: #0f172a;
+        color: #e2e8f0;
+      }
+      h1 {
+        font-size: 1rem;
+        margin: 0 0 1rem;
+      }
+      #status {
+        font-weight: bold;
+      }
+      .up {
+        color: #4ade80;
+      }
+      .down {
+        color: #f87171;
+      }
+      form {
+        margin: 1rem 0;
+        display: flex;
+        gap: 0.5rem;
+      }
+      input,
+      button {
+        font: inherit;
+        padding: 0.4rem 0.6rem;
+        border-radius: 4px;
+        border: 1px solid #334155;
+        background: #1e293b;
+        color: inherit;
+      }
+      button {
+        cursor: pointer;
+        background: #2563eb;
+        border-color: #2563eb;
+      }
+      pre {
+        background: #1e293b;
+        border: 1px solid #334155;
+        border-radius: 6px;
+        padding: 0.75rem;
+        max-height: 70vh;
+        overflow: auto;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>PitchPulse match client — <span id="status" class="down">connecting…</span></h1>
+
+    <form id="join-form">
+      <input id="match-id" placeholder="match id (from /matches/live)" autocomplete="off" />
+      <button type="submit">Join</button>
+      <button type="button" id="leave-btn">Leave</button>
+    </form>
+
+    <pre id="log"></pre>
+
+    <!-- Served by the Socket.io server itself once initSocket() has run. -->
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+      const logEl = document.getElementById('log');
+      const statusEl = document.getElementById('status');
+      const matchInput = document.getElementById('match-id');
+
+      function log(label, data) {
+        const ts = new Date().toISOString();
+        const body = data === undefined ? '' : '\n' + JSON.stringify(data, null, 2);
+        logEl.textContent += `[${ts}] ${label}${body}\n\n`;
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      const socket = io();
+
+      socket.on('connect', () => {
+        statusEl.textContent = 'connected (' + socket.id + ')';
+        statusEl.className = 'up';
+        log('connect', { id: socket.id });
+      });
+
+      socket.on('disconnect', (reason) => {
+        statusEl.textContent = 'disconnected';
+        statusEl.className = 'down';
+        log('disconnect', { reason });
+      });
+
+      socket.on('joined', (payload) => log('joined', payload));
+      socket.on('scoreUpdate', (payload) => log('scoreUpdate', payload));
+
+      document.getElementById('join-form').addEventListener('submit', (e) => {
+        e.preventDefault();
+        const id = matchInput.value.trim();
+        if (!id) return;
+        socket.emit('join-match', id, (ack) => log('join-match ack', ack));
+      });
+
+      document.getElementById('leave-btn').addEventListener('click', () => {
+        const id = matchInput.value.trim();
+        if (!id) return;
+        socket.emit('leave-match', id);
+        log('leave-match sent', { id });
+      });
+    </script>
+  </body>
+</html>
