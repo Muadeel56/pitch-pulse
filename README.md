@@ -7,8 +7,9 @@ for the full 10-phase build plan, and [`issues/`](./issues) for the phase-by-pha
 issue breakdown.
 
 This README currently covers **Phase 0 (Setup)**, **Phase 1 (Database
-Schema & Auth)**, and **Phase 2 (Core REST Endpoints — Follows + Match
-Listing)**.
+Schema & Auth)**, **Phase 2 (Core REST Endpoints — Follows + Match
+Listing)**, **Phase 3 (External API client)**, and **Phase 4 (Background
+polling job)**.
 
 ## Cricket data source decision
 
@@ -49,7 +50,7 @@ pitch-pulse/
 │   │   └── errorHandler.js  # centralized setErrorHandler / setNotFoundHandler
 │   ├── errors.js            # NotFoundError + ApiRateLimit/Unavailable/ParseError
 │   ├── jobs/
-│   │   └── pollScores.js    # stub — Phase 4
+│   │   └── pollScores.js    # BullMQ poll → diff → emit matchUpdated (Phase 4)
 │   ├── realtime/
 │   │   └── socket.js        # stub — Phase 6
 │   ├── events/
@@ -202,6 +203,71 @@ Config lives in `.env` (see `.env.example`): `CRICKET_API_KEY`,
 `CRICKET_API_MIN_INTERVAL_MS`. `CRICKET_MOCK_FAIL` (`<kind>[:<mode>[:<n>]]`,
 kind = `timeout|429|500|malformed`, mode = `once|always|everyNth`) forces the
 mock provider to fail — how the resilience paths are demoed without a real key.
+
+## Background polling job
+
+`src/jobs/pollScores.js` makes the app self-driving. A **BullMQ repeatable job**
+(Redis-backed) fires every `POLL_INTERVAL_MS` (default 45s, clamped 30–60s),
+calls `getLiveMatches()`, diffs the result against the last snapshot, and — only
+when something meaningful changed — writes the new snapshot and emits
+`matchUpdated` on the shared `notifier` (`src/events/notifier.js`; real listeners
+arrive in Phase 7). Start the app with no traffic and `info` logs show
+`poll #N: X matches, Y changed` on their own, continuously.
+
+`startPolling()` runs from `src/server.js` after `fastify.listen`; if the queue
+can't reach Redis the process exits non-zero (same stance as a failed Postgres
+connect). `stopPolling()` runs from `shutdown()` before Prisma disconnects —
+worker → queueEvents → queue → dedicated Redis connections, with a 10s hard
+timeout so a wedged job can't block Ctrl-C. BullMQ gets its **own** ioredis
+connections (`maxRetriesPerRequest: null`); the shared `redisClient` is used only
+for the `poll:*` keys below.
+
+**Redis keys** (all namespaced `poll:*` — Phase 5's caching layer must not collide):
+
+| Key             | Shape                                                        | Notes                                                                 |
+| --------------- | ---------------------------------------------------------- | ------------------------------------------------------------------- |
+| `poll:snapshot` | `{ "polledAt": <ISO string>, "matches": Match[] }` (JSON) | the last normalized poll result; written *before* the emit, skipped entirely on a no-change poll |
+| `poll:lock`     | opaque token string, `SET NX PX POLL_LOCK_TTL_MS`         | guards the critical section across processes / a resumed stuck job; released only if the token still matches (Lua `get`+`del`, never a blind `DEL`) |
+
+**`matchUpdated` event payload:** `{ polledAt, matches, changes }` where
+`matches` is the full new `Match[]` and `changes` is:
+
+| Field    | Value                                                                 |
+| -------- | ------------------------------------------------------------------- |
+| `id`     | match id                                                             |
+| `type`   | `'added'` \| `'removed'` \| `'changed'`                              |
+| `before` | prior match object (`null` for `added`)                              |
+| `after`  | new match object (`null` for `removed`)                              |
+| `fields` | for `changed`: subset of `['status', 'overs', 'score', 'wickets']` that moved (`wickets` is derived from the `score` `"runs/wkts"` map); empty for added/removed |
+
+The diff is keyed by match `id`, so array order is irrelevant, and it's computed
+against the *stored* snapshot — re-running the same poll data yields `0 changed`,
+so a retried job after a partial success is a harmless no-op.
+
+**Failure handling.** `runPollOnce()` lets `cricketApiClient` errors propagate to
+BullMQ: `attempts: 3`, `backoff: { type: 'exponential', delay: 2000 }`,
+`removeOnComplete: { count: 50 }`, `removeOnFail: { count: 100 }`. A transient
+error (`ApiUnavailableError` / `ApiRateLimitError`) is retried; the final failure
+is one `logger.error` line from the worker's `'failed'` handler and the process
+stays up. An `ApiParseError` (malformed body — fails identically every time) is
+mapped to a non-retryable `UnrecoverableError` so it **fails fast** instead of
+burning all 3 attempts. Worker `'error'` and the BullMQ connection `'error'` are
+logged too, never left as unhandled rejections.
+
+**First run:** if `poll:snapshot` is absent, the job seeds it and emits nothing
+(no boot-time notification storm).
+
+**Watch it work:** `docker compose up -d` then `npm run dev` — with no HTTP
+requests the `poll #N` lines appear every 30–60s (the mock evolves scores, so
+the diff fires regularly; drop `POLL_INTERVAL_MS=30000` if it's too quiet). Kill
+Redis mid-run → failures are logged and retried, the app doesn't crash; bring it
+back → polling resumes.
+
+Config lives in `.env` (see `.env.example`): `POLL_ENABLED` (default `true`; set
+`false` to run an instance that doesn't poll — useful for a second app process or
+tests), `POLL_INTERVAL_MS`, `POLL_LOCK_TTL_MS`. Multi-process worker scaling, a
+Bull Board dashboard, and a provider circuit breaker are **TODOs**, deliberately
+not built in this phase.
 
 ## Follows & Matches — manual verification
 

@@ -7,6 +7,7 @@ import errorHandlerPlugin from './plugins/errorHandler.js';
 import authRoutes from './routes/auth.js';
 import matchesRoutes from './routes/matches.js';
 import followsRoutes from './routes/follows.js';
+import { startPolling, stopPolling } from './jobs/pollScores.js';
 
 const fastify = Fastify({ logger: false }); // using our own logger.js instead of pino's default
 
@@ -39,11 +40,31 @@ async function start() {
     logger.error(`Failed to start server: ${err.message}`);
     process.exit(1);
   }
+
+  // A score app that can't poll isn't "up" — treat a queue that can't reach
+  // Redis the same as a failed Postgres connect (same pattern as above).
+  try {
+    await startPolling();
+  } catch (err) {
+    logger.error(`Failed to start polling job: ${err.message}`);
+    process.exit(1);
+  }
 }
 
+let shuttingDown = false;
+
 async function shutdown() {
-  await fastify.close();
-  await prisma.$disconnect();
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try {
+    await fastify.close();
+    // Stop polling before Prisma disconnects so no in-flight poll writes a
+    // half-baked snapshot or hits a closed connection.
+    await stopPolling();
+    await prisma.$disconnect();
+  } catch (err) {
+    logger.error(`Error during shutdown: ${err.message}`);
+  }
   process.exit(0);
 }
 
