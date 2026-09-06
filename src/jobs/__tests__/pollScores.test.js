@@ -2,7 +2,13 @@
 // `poll:test:` key prefix — no Worker, no 45s waits. `npm test` needs Redis up.
 import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
 
-import { runPollOnce, pollProcessor, diffMatches, __resetPollState } from '../pollScores.js';
+import {
+  runPollOnce,
+  pollProcessor,
+  diffMatches,
+  deriveMatchEvents,
+  __resetPollState,
+} from '../pollScores.js';
 import { redisClient, cacheTtlSeconds, CACHE_KEYS } from '../../cache/redisClient.js';
 import { notifier } from '../../events/notifier.js';
 import { getLiveMatches } from '../../lib/cricketApiClient.js';
@@ -229,6 +235,64 @@ describe('pollProcessor', () => {
     getLiveMatches.mockRejectedValue(new ApiUnavailableError('down'));
 
     await expect(pollProcessor()).rejects.toBeInstanceOf(ApiUnavailableError);
+  });
+});
+
+describe('deriveMatchEvents', () => {
+  const polledAt = '2026-09-06T00:00:00.000Z';
+  const changed = (id, before, after, fields) => ({ id, type: 'changed', before, after, fields });
+  const names = (evts) => evts.map((e) => e.name);
+
+  it('upcoming → live yields a single matchStarted', () => {
+    const c = changed(
+      '3',
+      { id: '3', teams: ['A', 'B'], status: 'upcoming', score: null },
+      { id: '3', teams: ['A', 'B'], status: 'live', score: { A: '0/0', B: '0/0' } },
+      ['status', 'score'],
+    );
+    const evts = deriveMatchEvents({ polledAt, changes: [c] });
+    expect(names(evts)).toEqual(['matchStarted']);
+    expect(evts[0].payload).toEqual({ matchId: '3', teams: ['A', 'B'], polledAt });
+  });
+
+  it('a brand-new match already live yields matchStarted', () => {
+    const c = {
+      id: '9',
+      type: 'added',
+      before: null,
+      after: { id: '9', teams: ['A', 'B'], status: 'live', score: { A: '0/0' } },
+      fields: [],
+    };
+    expect(names(deriveMatchEvents({ polledAt, changes: [c] }))).toEqual(['matchStarted']);
+  });
+
+  it('wicket count up yields wicketFallen with the right delta', () => {
+    const c = changed(
+      '3',
+      { score: { A: '80/2', B: '0/0' } },
+      { score: { A: '80/4', B: '0/0' } },
+      ['score', 'wickets'],
+    );
+    const evts = deriveMatchEvents({ polledAt, changes: [c] });
+    expect(names(evts)).toEqual(['wicketFallen']);
+    expect(evts[0].payload).toMatchObject({ matchId: '3', teamName: 'A', wickets: 4, delta: 2 });
+  });
+
+  it('runs 48 → 52 yields milestoneReached milestone 50', () => {
+    const c = changed('3', { score: { A: '48/0' } }, { score: { A: '52/0' } }, ['score']);
+    const evts = deriveMatchEvents({ polledAt, changes: [c] });
+    expect(names(evts)).toEqual(['milestoneReached']);
+    expect(evts[0].payload).toMatchObject({ teamName: 'A', runs: 52, milestone: 50 });
+  });
+
+  it('runs 52 → 60 (no new 50-boundary crossed) yields nothing', () => {
+    const c = changed('3', { score: { A: '52/0' } }, { score: { A: '60/0' } }, ['score']);
+    expect(deriveMatchEvents({ polledAt, changes: [c] })).toEqual([]);
+  });
+
+  it('no changes yields an empty array', () => {
+    expect(deriveMatchEvents({ polledAt, changes: [] })).toEqual([]);
+    expect(deriveMatchEvents({ polledAt, changes: undefined })).toEqual([]);
   });
 });
 
