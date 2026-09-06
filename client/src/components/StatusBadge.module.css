@@ -1,0 +1,26 @@
+.badge {
+  display: inline-block;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.live {
+  background: rgba(74, 222, 128, 0.15);
+  color: var(--success);
+}
+.completed {
+  background: rgba(148, 163, 184, 0.15);
+  color: var(--text-dim);
+}
+.upcoming {
+  background: rgba(251, 191, 36, 0.15);
+  color: var(--warn);
+}
+.unknown {
+  background: rgba(148, 163, 184, 0.12);
+  color: var(--text-dim);
+}

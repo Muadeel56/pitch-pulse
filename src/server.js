@@ -11,6 +11,7 @@ import authRoutes from './routes/auth.js';
 import matchesRoutes from './routes/matches.js';
 import followsRoutes from './routes/follows.js';
 import notificationsRoutes from './routes/notifications.js';
+import referenceRoutes from './routes/reference.js';
 import { startPolling, stopPolling } from './jobs/pollScores.js';
 import { initSocket, closeSocket } from './realtime/socket.js';
 import {
@@ -28,6 +29,18 @@ if (missingEnv.length > 0) {
 }
 
 const fastify = Fastify({ logger: false }); // using our own logger.js instead of pino's default
+
+// Browser CORS for the React client (client/). Registered before every route so
+// the preflight (OPTIONS) is answered for all of them. CORS_ORIGIN is a
+// comma-separated allow-list; defaults to the Vite dev server origin. The
+// Socket.io server has its own CORS knob (SOCKET_CORS_ORIGIN).
+await fastify.register(import('@fastify/cors'), {
+  origin: (process.env.CORS_ORIGIN || 'http://localhost:5173')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean),
+  credentials: true,
+});
 
 // Our own API rate limit (Phase 10). Registered before any route so it wraps
 // all of them. Keyed by user id once authenticated, else by IP. /health and
@@ -58,6 +71,10 @@ await fastify.register(authRoutes);
 await fastify.register(matchesRoutes, { prefix: '/matches' });
 await fastify.register(followsRoutes, { prefix: '/follows' });
 await fastify.register(notificationsRoutes, { prefix: '/notifications' });
+// Read-only reference lists (seeded teams / players) so the client can offer a
+// "browse and follow" view — the follow endpoints need a Team/Player UUID that
+// isn't otherwise discoverable. No prefix: paths are /teams and /players.
+await fastify.register(referenceRoutes);
 
 // Phase 6 — a single static diagnostic page for the WebSocket push. One file
 // doesn't justify pulling in @fastify/static, so it's a one-off route that
