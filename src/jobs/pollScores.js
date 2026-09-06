@@ -341,6 +341,16 @@ export async function pollProcessor() {
 
 // ── Lifecycle ───────────────────────────────────────────────────────────────
 
+/**
+ * Whether the poll scheduler is currently running. Used by GET /ready.
+ * Note: this is `false` when POLL_ENABLED=false — that's an intentional
+ * configuration, so /ready treats a stopped poller as "degraded", not a failure.
+ * @returns {boolean}
+ */
+export function isPollingStarted() {
+  return started;
+}
+
 export async function startPolling() {
   if (started) return;
 

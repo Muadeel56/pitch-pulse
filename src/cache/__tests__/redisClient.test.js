@@ -60,6 +60,38 @@ describe('cacheDel', () => {
   });
 });
 
+describe('resilience — Redis connection errors degrade to a miss, never throw', () => {
+  const boom = () => Promise.reject(new Error('Connection is closed'));
+
+  it('cacheGet returns null and warns when the GET rejects', async () => {
+    vi.spyOn(redisClient, 'get').mockImplementation(boom);
+
+    expect(await cacheGet(K)).toBeNull();
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringMatching(/Redis GET .* failed/));
+  });
+
+  it('cacheSet swallows a rejected SET (logged, not thrown)', async () => {
+    vi.spyOn(redisClient, 'set').mockImplementation(boom);
+
+    await expect(cacheSet(K, { a: 1 }, 60)).resolves.toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringMatching(/Redis SET .* failed/));
+  });
+
+  it('cacheSet still throws a TypeError for a bad ttl BEFORE touching Redis', async () => {
+    const set = vi.spyOn(redisClient, 'set').mockImplementation(boom);
+
+    await expect(cacheSet(K, { a: 1 }, 0)).rejects.toThrow(TypeError);
+    expect(set).not.toHaveBeenCalled();
+  });
+
+  it('cacheDel swallows a rejected DEL', async () => {
+    vi.spyOn(redisClient, 'del').mockImplementation(boom);
+
+    await expect(cacheDel(K)).resolves.toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringMatching(/Redis DEL .* failed/));
+  });
+});
+
 describe('cacheTtlSeconds', () => {
   it('defaults to 120 and clamps to a 30s floor', () => {
     vi.stubEnv('CACHE_TTL_SECONDS', '');

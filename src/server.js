@@ -6,6 +6,7 @@ import { logger } from './utils/logger.js';
 import { prisma } from './lib/prisma.js';
 import authenticatePlugin from './plugins/authenticate.js';
 import errorHandlerPlugin from './plugins/errorHandler.js';
+import healthRoutes from './routes/health.js';
 import authRoutes from './routes/auth.js';
 import matchesRoutes from './routes/matches.js';
 import followsRoutes from './routes/follows.js';
@@ -17,7 +18,33 @@ import {
   closeNotificationHandlers,
 } from './events/notificationHandlers.js';
 
+// Fail loudly at boot if a required secret/URL is missing, rather than as a
+// confusing per-request 401/500 much later. Checked before we build anything.
+const REQUIRED_ENV = ['JWT_SECRET', 'DATABASE_URL', 'REDIS_URL'];
+const missingEnv = REQUIRED_ENV.filter((name) => !process.env[name]);
+if (missingEnv.length > 0) {
+  logger.error(`Missing required environment variable(s): ${missingEnv.join(', ')}`);
+  process.exit(1);
+}
+
 const fastify = Fastify({ logger: false }); // using our own logger.js instead of pino's default
+
+// Our own API rate limit (Phase 10). Registered before any route so it wraps
+// all of them. Keyed by user id once authenticated, else by IP. /health and
+// /ready are allow-listed so monitors are never throttled. A throttled request
+// returns the app's standard error envelope, not rate-limit's default shape.
+await fastify.register(import('@fastify/rate-limit'), {
+  max: Number(process.env.RATE_LIMIT_MAX) || 100,
+  timeWindow: process.env.RATE_LIMIT_WINDOW || '1 minute',
+  keyGenerator: (req) => req.user?.id ?? req.ip,
+  allowList: (req) => req.url === '/health' || req.url === '/ready',
+  errorResponseBuilder: (_req, context) => ({
+    error: {
+      message: `Rate limit exceeded, retry in ${Math.ceil(context.ttl / 1000)}s`,
+      code: 'RATE_LIMITED',
+    },
+  }),
+});
 
 // Called directly (not via fastify.register) so the `authenticate` decorator
 // and the error handler land on the root instance instead of being scoped to
@@ -26,6 +53,7 @@ const fastify = Fastify({ logger: false }); // using our own logger.js instead o
 // throw (Zod, Prisma, NotFoundError, ...) is caught centrally.
 await authenticatePlugin(fastify);
 await errorHandlerPlugin(fastify);
+await fastify.register(healthRoutes);
 await fastify.register(authRoutes);
 await fastify.register(matchesRoutes, { prefix: '/matches' });
 await fastify.register(followsRoutes, { prefix: '/follows' });

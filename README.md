@@ -10,7 +10,11 @@ This README currently covers **Phase 0 (Setup)**, **Phase 1 (Database
 Schema & Auth)**, **Phase 2 (Core REST Endpoints — Follows + Match
 Listing)**, **Phase 3 (External API client)**, **Phase 4 (Background
 polling job)**, **Phase 5 (Caching layer)**, **Phase 6 (Real-time
-push — WebSockets)**, and **Phase 7 (Event-driven notifications)**.
+push — WebSockets)**, **Phase 7 (Event-driven notifications)**,
+**Phase 8 (Error handling & resilience)**, **Phase 9 (Dockerize
+everything)**, and **Phase 10 (Polish — rate limiting, structured
+logging, test suite)**. The React frontend is the one remaining phase
+(tracked as its own issue).
 
 ## Cricket data source decision
 
@@ -43,6 +47,7 @@ pitch-pulse/
 ├── src/
 │   ├── server.js            # Fastify app entrypoint
 │   ├── routes/
+│   │   ├── health.js        # GET /health (liveness), GET /ready (readiness) — Phase 8
 │   │   ├── auth.js          # signup / login / me
 │   │   ├── matches.js       # GET /matches/live, GET /matches/:id (via cricketApiClient)
 │   │   ├── follows.js       # follow/unfollow team/player, GET /follows
@@ -72,16 +77,66 @@ pitch-pulse/
 │   │   ├── follows.js       # zod schemas (teamId/playerId params)
 │   │   └── matches.js       # zod schema (match id param)
 │   └── utils/
-│       └── logger.js        # leveled console logger
+│       └── logger.js        # pino-backed structured logger (stable {logger} surface)
 ├── prisma/
 │   ├── schema.prisma
 │   └── seed.js               # sample Team/Player rows (npx prisma db seed)
-├── docker-compose.yml
+├── test/
+│   ├── setup.js              # vitest setupFile — loads .env.test
+│   └── db.js                 # truncateAll() for the DB-backed route suites
+├── scripts/
+│   └── setup-test-db.js      # creates + migrates pitchpulse_test (pretest hook)
+├── Dockerfile                # multi-stage (deps → runtime), non-root, Phase 9
+├── docker-entrypoint.sh      # runs `prisma migrate deploy` then the CMD
+├── .dockerignore
+├── docker-compose.yml        # app + postgres + redis, one stack
+├── vitest.config.js
 ├── .env.example
 └── package.json
 ```
 
-## Setup
+## Run the whole stack (Docker)
+
+The fastest path from a clean clone to a running API — `app` + `postgres` +
+`redis` as one stack, migrations run automatically on startup.
+
+```bash
+git clone https://github.com/Muadeel56/pitch-pulse.git
+cd pitch-pulse
+cp .env.example .env          # then set JWT_SECRET to a long random string
+docker compose up --build     # app waits for db+redis health, runs migrate deploy, starts
+
+# First run only — seed the Team/Player rows the follow endpoints need:
+RUN_DB_SEED=true docker compose up --build
+#   ...or, once the stack is already up:
+docker compose exec app npx prisma db seed
+```
+
+Then `curl localhost:3000/health` → `200`, `curl localhost:3000/ready` → `200`
+with every check `up`.
+
+| Command | Effect |
+| --- | --- |
+| `docker compose up --build` | build + start all three services (foreground) |
+| `docker compose up -d` | same, detached |
+| `docker compose down` | stop + remove containers (named volumes persist) |
+| `docker compose down -v` | also wipe `pgdata` / `redisdata` — full clean slate |
+| `docker compose logs -f app` | tail the app log |
+| `docker compose exec app sh` | shell into the running app container |
+
+**`localhost` vs service names — the #1 gotcha.** Inside the compose network the
+app reaches the other containers by **service name**: `postgres:5432` and
+`redis:6379` — *not* `localhost`, and *not* the `5434` host port.
+`docker-compose.yml` overrides `DATABASE_URL` / `REDIS_URL` to that form, so
+`.env` can keep the `localhost:5434` / `localhost:6379` form for host-side
+tooling (`npx prisma studio`, `psql`). `migrate deploy` is idempotent — it runs
+on every container start and is a no-op when there's nothing pending.
+
+## Setup (local dev against containerized pg + redis)
+
+For active development — `node --watch` reload, tests — run the app on the host
+against just the containerized Postgres + Redis. (`node --watch` doesn't belong
+in the image.)
 
 1. Install dependencies:
    ```bash
@@ -92,9 +147,9 @@ pitch-pulse/
    cp .env.example .env
    ```
    (`JWT_SECRET` should be a long random string in real use — see below.)
-3. Start Postgres and Redis:
+3. Start just Postgres and Redis:
    ```bash
-   docker compose up -d
+   docker compose up -d postgres redis
    ```
    > **Note:** Postgres is mapped to host port **5434** (not the default 5432)
    > to avoid clashing with any other local Postgres instance. `DATABASE_URL`
@@ -113,20 +168,11 @@ pitch-pulse/
    npm run dev
    ```
 
-## Docker Compose usage
-
-- `docker compose up -d` — start Postgres + Redis in the background
-- `docker compose ps` — check container/health status
-- `docker compose logs -f postgres` / `redis` — tail logs
-- `docker compose down` — stop and remove containers (data persists in named volumes)
-- `docker compose down -v` — stop and also wipe the volumes (fresh DB/cache)
-
-Only `postgres` and `redis` are containerized for now — the Node app runs
-locally against them. Dockerizing the app itself is Phase 9.
-
 ## Prisma workflow
 
-- `npm run prisma:migrate` — create/apply a migration in dev
+- `npm run prisma:migrate` — create/apply a migration in dev (`migrate dev`)
+- `npm run prisma:deploy` — apply pending migrations, no prompts (`migrate deploy`;
+  what the Docker entrypoint runs)
 - `npm run prisma:generate` — regenerate the Prisma client after schema changes
 - `npm run prisma:studio` — open Prisma Studio to browse data
 
@@ -154,9 +200,15 @@ trace or Fastify's default `{ statusCode, error, message }` body:
 | `NotFoundError` (unknown team/player/match)       | 404    | `NOT_FOUND`         |
 | Unmatched route                                  | 404    | `NOT_FOUND`         |
 | Prisma `P2002` (duplicate follow)                | 409    | `ALREADY_FOLLOWING` |
+| Rate limit exceeded (`@fastify/rate-limit`)      | 429    | `RATE_LIMITED`      |
 | `ApiParseError` (bad upstream shape)             | 502    | `BAD_GATEWAY`       |
 | `ApiRateLimitError` / `ApiUnavailableError`      | 503    | `SERVICE_UNAVAILABLE` |
+| Prisma connection failure (`P1001`, init/panic)  | 503    | `DB_UNAVAILABLE`    |
 | Anything else                                    | 500    | `INTERNAL_ERROR`    |
+
+The `DB_UNAVAILABLE` row is Phase 8: a mid-request Postgres drop (container
+stopped, network blip) returns a clean, retryable 503 and the process stays up
+— Prisma reconnects on its own on the next query.
 
 Routes that already build their own response directly (auth.js's 401s/409s,
 authenticate.js's 401s) never throw, so they're unaffected by this handler —
@@ -397,6 +449,66 @@ events, e.g. a second app process) is read once at startup.
 newest-first. Also `PATCH /notifications/:id/read` (204; 404 if not the caller's)
 and `POST /notifications/read-all` (`{ updated }`).
 
+## Resilience, health checks & rate limiting (Phase 8 & 10)
+
+**Every dependency can fail without taking the process down:**
+
+| Failure | Behaviour |
+| --- | --- |
+| **Postgres** drops mid-request | `503 { code: 'DB_UNAVAILABLE' }`; process stays up; recovers on its own when Postgres returns |
+| **Redis** drops | `cacheGet` treats it as a miss, `/matches/*` fall back to `cricketApiClient` directly and still return `200`; `cacheSet`/`cacheDel` errors are logged and swallowed (a bad `ttlSeconds` still throws — that's a bug, not an outage). One `warn` per lost/reconnected edge. Next poll re-warms the cache. |
+| **Cricket API** 5xx | poll job retries via BullMQ (`attempts: 3`, exponential backoff), logs one line from `worker.on('failed')`, tries again next interval |
+| **Cricket API** malformed body | `ApiParseError` → non-retryable `UnrecoverableError` (no retry storm); a direct route hit → `502 BAD_GATEWAY` |
+| Invalid / expired / tampered **JWT** | `401 { code: 'UNAUTHORIZED' }`, identical body, never a stack trace |
+| **WebSocket** client disconnects mid-session | Socket.io clears its rooms; the process-wide `notifier` bridge is untouched; later broadcasts still work |
+| Missing `JWT_SECRET` / `DATABASE_URL` / `REDIS_URL` | `process.exit(1)` at boot with a named-variable log line — never a per-request failure |
+
+**Health endpoints** (unauthenticated, rate-limit-exempt):
+
+- `GET /health` → always `200 { "status": "ok" }` — liveness, what a container
+  `restart` policy / supervisor watches.
+- `GET /ready` → dependency probe:
+  ```json
+  { "status": "degraded",
+    "checks": { "postgres": "up", "redis": "down", "poller": "up" } }
+  ```
+  `200` while Postgres is reachable (Redis down is `"degraded"` — still serving
+  via fallback); `503 "unavailable"` only when the Postgres probe fails.
+  `poller: "down"` just means `POLL_ENABLED=false` or the queue never started.
+
+**Rate limiting** (`@fastify/rate-limit`, Phase 10): global, keyed by user id
+when authenticated else client IP. `RATE_LIMIT_MAX` (default `100`) per
+`RATE_LIMIT_WINDOW` (default `"1 minute"`). `/health` and `/ready` are
+allow-listed. `/auth/login` and `/auth/signup` carry a tighter built-in limit
+(10 per 5 minutes) to blunt credential stuffing. A throttled request gets
+`429 { error: { code: 'RATE_LIMITED', message: '...' } }` — the app's standard
+envelope, not the plugin's default shape.
+
+**Force-fail a dependency to see it:** `docker compose stop postgres` then hit
+any DB route (→ 503); `docker compose stop redis` then `curl /matches/live`
+(→ still 200, watch for the fallback `warn`); `CRICKET_MOCK_FAIL=500:always` in
+the app env then `docker compose up -d app` (→ poll retries logged, process alive).
+
+## Structured logging (Phase 10)
+
+`src/utils/logger.js` is backed by [`pino`](https://getpino.io). The exported
+surface is unchanged — `logger.info/warn/error/debug(msg[, fields])` — so the
+modules that `import { logger }` didn't change. Human-readable via `pino-pretty`
+in dev; **JSON lines when `NODE_ENV=production`** (as in the Docker image).
+Level is `LOG_LEVEL` (default `info`; `debug` only renders at `LOG_LEVEL=debug`).
+`src/lib/**` and `retry.js` remain the only modules allowed to emit output, and
+only through `logger`.
+
+## Pagination
+
+- **`GET /notifications`** — cursor pagination. `?limit=` (default 50, hard cap
+  100), `?before=<ISO createdAt>` as the cursor; the response's `nextCursor` is
+  the oldest row's `createdAt` on a full page, `null` otherwise — feed it back in
+  as `?before=`.
+- **`GET /matches/live`** — deliberately **not** paginated. The live-match list
+  is inherently tiny (a handful of concurrent internationals) and the WS client
+  consumes the bare-array shape. Noted in a comment in `src/routes/matches.js`.
+
 ## Follows & Matches — manual verification
 
 **Design decisions:**
@@ -507,3 +619,31 @@ curl -i http://localhost:3000/me -H "Authorization: Bearer garbage.token.value"
 All error responses use a consistent shape: `{ "error": { "message": "...", "code": "..." } }`.
 From Phase 2 onward this is enforced centrally for every route — see
 "Centralized error handling" above for the full list of codes.
+
+## Running the tests
+
+```bash
+docker compose up -d postgres redis   # the suites need a live Redis + Postgres
+npm test                              # vitest run
+```
+
+`npm test` has a `pretest` hook that runs `node scripts/setup-test-db.js`:
+it creates the **`pitchpulse_test`** database (separate from dev data — a run
+never touches `pitchpulse`) if missing and applies `prisma migrate deploy`
+against it. `test/setup.js` (a vitest `setupFile`) loads **`.env.test`**, which
+points `DATABASE_URL` at that database and sets `POLL_ENABLED=false` /
+`NOTIFICATIONS_ENABLED=false`. Run the DB setup on its own with `npm run test:db`.
+
+**What's covered** (`vitest`, ~113 cases across 12 files):
+
+| Suite | Focus |
+| --- | --- |
+| `routes/__tests__/auth.test.js` | signup (201 / 409 `EMAIL_TAKEN` / 400) · login (200 + JWT / 401 `INVALID_CREDENTIALS`, no user enumeration) · `GET /me` token matrix — real DB |
+| `routes/__tests__/follows.test.js` | follow/unfollow team + player · 409 / 404 / 400 · `GET /follows` scoped to the caller · every route 401 without a token — real DB |
+| `plugins/__tests__/authenticate.test.js` | valid token → `request.user`; deleted-user token, expired, tampered, wrong secret, bad scheme → identical 401, never 500 |
+| `routes/__tests__/health.test.js` | `/health` always 200; `/ready` 200 with checks, 503 when the Postgres probe fails |
+| `routes/__tests__/matches.test.js` | cache hit / cold-miss fallback / re-warm · 503 / 502 / 404 upstream mapping |
+| `cache/__tests__/redisClient.test.js` | JSON round-trip + TTL · corrupt JSON → miss · **connection error → miss, `cacheSet`/`Del` swallow, bad ttl still throws** |
+| `jobs/__tests__/pollScores.test.js` | `runPollOnce` lock/snapshot/diff/emit · cache warming · `pollProcessor` retry vs `UnrecoverableError` |
+| `realtime/__tests__/socket.test.js` | room join/leave · mid-session disconnect leaves the notifier bridge intact · `matchUpdated` → room broadcast |
+| `lib/__tests__/*`, `events/__tests__/*`, `routes/__tests__/notifications.test.js` | cricket client, retry, notification handlers + route (mocked Prisma) |

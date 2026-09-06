@@ -1,10 +1,39 @@
 services:
+  # The Node app. `docker compose up --build` builds the image, waits for
+  # postgres + redis to pass their healthchecks, runs `prisma migrate deploy`
+  # via the entrypoint, then starts the server.
+  app:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # `.env` drives both this stack and a local `npm run dev`. The two URLs
+    # below override whatever `.env` has: inside the compose network the
+    # hostnames are the SERVICE NAMES (postgres:5432 / redis:6379) — NOT
+    # localhost, and NOT the 5434 host port. compose merges env_file + environment
+    # with `environment` winning, so `.env` can keep the localhost forms for
+    # host-side tooling (psql, prisma studio).
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://pitchpulse:pitchpulse@postgres:5432/pitchpulse?schema=public
+      REDIS_URL: redis://redis:6379
+      PORT: 3000
+      RUN_DB_SEED: ${RUN_DB_SEED:-false}
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
   postgres:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: pitchpulse
       POSTGRES_PASSWORD: pitchpulse
       POSTGRES_DB: pitchpulse
+    # Host port 5434 (not 5432) so it doesn't clash with a local Postgres and
+    # host-side `npx prisma studio` / `psql` keep working. Containers on the
+    # compose network reach it on 5432.
     ports:
       - "5434:5432"
     volumes:
@@ -27,6 +56,8 @@ services:
       timeout: 5s
       retries: 5
 
+# All three services sit on compose's default network, so no custom `networks:`
+# block is needed — they resolve each other by service name.
 volumes:
   pgdata:
   redisdata:

@@ -13,6 +13,12 @@ import { logger } from '../utils/logger.js';
 // see issue #5 "out of scope") and it logs when it happens. Typed client errors
 // (ApiUnavailableError / ApiRateLimitError / ApiParseError) still bubble to
 // errorHandler.js, which degrades them to a clean 503/502.
+// Pagination note (Phase 10): GET /live returns a bare array and is
+// deliberately NOT paginated. The live-match list is inherently tiny (a handful
+// of concurrent internationals; the mock provider returns ~4), the WS client
+// and tests consume the array shape directly, and a cursor contract here would
+// be all cost, no benefit. GET /notifications is where cursor pagination lives
+// (limit capped at 100, `before` <-> `nextCursor`) — see the README.
 export default async function matchesRoutes(fastify) {
   fastify.get('/live', { onRequest: [fastify.authenticate] }, async () => {
     const cached = await cacheGet(CACHE_KEYS.liveList);
