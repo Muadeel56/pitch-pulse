@@ -21,8 +21,24 @@ services:
       REDIS_URL: redis://redis:6379
       PORT: 3000
       RUN_DB_SEED: ${RUN_DB_SEED:-false}
+      # The React client (see the `client` service) is reached at :5173. It
+      # proxies API + Socket.io calls same-origin, but set the allow-lists
+      # explicitly so a direct cross-origin call from the browser also works.
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:5173}
+      SOCKET_CORS_ORIGIN: ${SOCKET_CORS_ORIGIN:-http://localhost:5173}
     ports:
       - "3000:3000"
+    restart: unless-stopped
+
+  # The React SPA (client/), built to static files and served by nginx, which
+  # also reverse-proxies /auth, /matches, /follows, /notifications, /teams,
+  # /players and /socket.io to the `app` service.
+  client:
+    build: ./client
+    depends_on:
+      - app
+    ports:
+      - "5173:80"
     restart: unless-stopped
 
   postgres:

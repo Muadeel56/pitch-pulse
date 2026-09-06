@@ -1,0 +1,54 @@
+.card {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem 1.1rem;
+  transition: border-color 0.15s ease;
+}
+
+a:hover > .card {
+  border-color: var(--accent);
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.75rem;
+}
+
+.overs {
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+
+.teams {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.team {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+.teams > .team:last-child {
+  text-align: right;
+}
+
+.name {
+  font-weight: 600;
+}
+
+.score {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+}
+
+.vs {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  text-transform: uppercase;
+}
