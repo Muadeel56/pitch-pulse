@@ -9,8 +9,13 @@ import errorHandlerPlugin from './plugins/errorHandler.js';
 import authRoutes from './routes/auth.js';
 import matchesRoutes from './routes/matches.js';
 import followsRoutes from './routes/follows.js';
+import notificationsRoutes from './routes/notifications.js';
 import { startPolling, stopPolling } from './jobs/pollScores.js';
 import { initSocket, closeSocket } from './realtime/socket.js';
+import {
+  initNotificationHandlers,
+  closeNotificationHandlers,
+} from './events/notificationHandlers.js';
 
 const fastify = Fastify({ logger: false }); // using our own logger.js instead of pino's default
 
@@ -24,6 +29,7 @@ await errorHandlerPlugin(fastify);
 await fastify.register(authRoutes);
 await fastify.register(matchesRoutes, { prefix: '/matches' });
 await fastify.register(followsRoutes, { prefix: '/follows' });
+await fastify.register(notificationsRoutes, { prefix: '/notifications' });
 
 // Phase 6 — a single static diagnostic page for the WebSocket push. One file
 // doesn't justify pulling in @fastify/static, so it's a one-off route that
@@ -73,6 +79,17 @@ async function start() {
     logger.error(`Failed to start polling job: ${err.message}`);
     process.exit(1);
   }
+
+  // Reactive notification listeners on the shared notifier. Attaching them is
+  // sync and can only fail on a programming error, but treat that as fatal for
+  // consistency with the blocks above.
+  try {
+    initNotificationHandlers();
+    logger.info('Notification handlers attached');
+  } catch (err) {
+    logger.error(`Failed to attach notification handlers: ${err.message}`);
+    process.exit(1);
+  }
 }
 
 let shuttingDown = false;
@@ -85,6 +102,9 @@ async function shutdown() {
     // Close Socket.io before the poller: a late `matchUpdated` emit then finds
     // no listener attached rather than emitting into a half-closed `io`.
     await closeSocket();
+    // Detach the notification listeners before stopping the poller, so a late
+    // `matchUpdated`/semantic emit finds nothing attached.
+    closeNotificationHandlers();
     // Stop polling before Prisma disconnects so no in-flight poll writes a
     // half-baked snapshot or hits a closed connection.
     await stopPolling();

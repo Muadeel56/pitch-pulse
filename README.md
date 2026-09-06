@@ -9,8 +9,8 @@ issue breakdown.
 This README currently covers **Phase 0 (Setup)**, **Phase 1 (Database
 Schema & Auth)**, **Phase 2 (Core REST Endpoints — Follows + Match
 Listing)**, **Phase 3 (External API client)**, **Phase 4 (Background
-polling job)**, **Phase 5 (Caching layer)**, and **Phase 6 (Real-time
-push — WebSockets)**.
+polling job)**, **Phase 5 (Caching layer)**, **Phase 6 (Real-time
+push — WebSockets)**, and **Phase 7 (Event-driven notifications)**.
 
 ## Cricket data source decision
 
@@ -45,7 +45,8 @@ pitch-pulse/
 │   ├── routes/
 │   │   ├── auth.js          # signup / login / me
 │   │   ├── matches.js       # GET /matches/live, GET /matches/:id (via cricketApiClient)
-│   │   └── follows.js       # follow/unfollow team/player, GET /follows
+│   │   ├── follows.js       # follow/unfollow team/player, GET /follows
+│   │   └── notifications.js # GET /notifications (+ mark-read), Phase 7
 │   ├── plugins/
 │   │   ├── authenticate.js  # JWT auth hook (fastify.authenticate)
 │   │   └── errorHandler.js  # centralized setErrorHandler / setNotFoundHandler
@@ -53,9 +54,10 @@ pitch-pulse/
 │   ├── jobs/
 │   │   └── pollScores.js    # BullMQ poll → diff → emit matchUpdated (Phase 4)
 │   ├── realtime/
-│   │   └── socket.js        # stub — Phase 6
+│   │   └── socket.js        # Socket.io server + matchUpdated → room bridge (Phase 6)
 │   ├── events/
-│   │   └── notifier.js      # stub — Phase 7
+│   │   ├── notifier.js      # shared EventEmitter singleton
+│   │   └── notificationHandlers.js # semantic-event listeners → Notification rows (Phase 7)
 │   ├── cache/
 │   │   └── redisClient.js   # ioredis client
 │   ├── lib/
@@ -346,6 +348,54 @@ and logs connection events, `joined`, and every `scoreUpdate` to the page. Open
 it in two tabs on the same match id (from `/matches/live`; set
 `POLL_INTERVAL_MS=30000` for speed) and both update within seconds of a poll
 change, no refresh; a tab on a different match gets nothing.
+
+## Event-driven notifications
+
+The payoff for keeping change-detection decoupled from what-to-do-about-it. The
+poll job already emits `matchUpdated` on every real diff; Phase 7 adds a pure
+helper `deriveMatchEvents({ polledAt, changes })` in `src/jobs/pollScores.js`
+that turns that same `changes[]` into **semantic events**, emitted on the shared
+`notifier` right after `matchUpdated`:
+
+| Event | Fires when | Payload |
+|---|---|---|
+| `matchStarted` | a match's `status` moves into `live` (or a new match appears already live) | `{ matchId, teams, polledAt }` |
+| `wicketFallen` | a team's wicket count (parsed from the `runs/wkts` score map) increases | `{ matchId, teamName, wickets, delta, polledAt }` |
+| `milestoneReached` | a team's run total crosses a multiple of 50 | `{ matchId, teamName, runs, milestone, polledAt }` |
+
+`src/events/notificationHandlers.js` (`initNotificationHandlers()` /
+`closeNotificationHandlers()`, mirroring the `socket.js` lifecycle — explicit
+listener refs, one per event, never `removeAllListeners()`) reacts to each: it
+resolves the team **name → seeded `Team.id`**, finds every `FollowedTeam` for
+that id, and `createMany`s one `Notification` row per follower. It imports
+nothing from `src/realtime/` or `src/cache/` — it only knows the emitter and
+Prisma. Wired into `server.js` `start()` (after `startPolling()`) and
+`shutdown()` (before `stopPolling()`).
+
+**Idempotency** is inherited for free: the poll only emits on a real diff versus
+the stored snapshot, so a retried/overlapping poll produces `0 changed` and
+these events never fire twice for the same change.
+
+**Limitations (deliberate, not worked around):**
+- Team name ↔ id is a plain string match against `Team.name` from the seed. An
+  event for a team that isn't seeded (e.g. `"New Zealand"`) silently produces no
+  notifications — a real `externalRef` on `Team` is a later issue.
+- No player-level events — the normalized match shape has no per-batter data, so
+  `wicketFallen` can't name the dismissed batter (`Notification.playerId` stays
+  `null`) and `milestoneReached` is team-total runs at 50-run steps, not
+  individual fifties/centuries.
+- Same single-process assumption as Phase 6 (no Socket.io Redis adapter) and
+  Phase 4 (one worker).
+
+`NOTIFICATIONS_ENABLED` (`.env`, default `true`; set `false` to skip persisting
+events, e.g. a second app process) is read once at startup.
+
+**`GET /notifications`** — protected, scoped strictly to the caller:
+`?unread=true|false` (optional), `?limit=` (default 50, capped at 100),
+`?before=` (ISO timestamp, `createdAt <` cursor). Returns
+`{ notifications: [{ id, type, message, matchId, teamId, read, createdAt }], nextCursor }`
+newest-first. Also `PATCH /notifications/:id/read` (204; 404 if not the caller's)
+and `POST /notifications/read-all` (`{ updated }`).
 
 ## Follows & Matches — manual verification
 

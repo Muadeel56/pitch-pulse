@@ -14,6 +14,7 @@ model User {
   createdAt       DateTime         @default(now())
   followedTeams   FollowedTeam[]
   followedPlayers FollowedPlayer[]
+  notifications   Notification[]
 }
 
 model Team {
@@ -44,6 +45,32 @@ model FollowedTeam {
   team      Team     @relation(fields: [teamId], references: [id], onDelete: Cascade)
 
   @@unique([userId, teamId])
+}
+
+// Phase 7 — a persisted notification derived from a semantic match event
+// (wicketFallen / milestoneReached / matchStarted) for a user who follows the
+// relevant team.
+//
+// `matchId` is the normalized cricket match id (a short string like "3", not a
+// UUID — matches aren't stored in Postgres). `teamId` references a seeded
+// Team.id when the event's team name resolves via prisma.team.findFirst;
+// otherwise no Notification is created at all. `playerId` is effectively always
+// null — the normalized match shape (src/lib/cricketSchemas.js) carries no
+// per-batter data — but the column exists for forward-compat.
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String
+  type      String // 'wicketFallen' | 'milestoneReached' | 'matchStarted'
+  message   String
+  matchId   String
+  teamId    String?
+  playerId  String?
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, read])
+  @@index([userId, createdAt])
 }
 
 // Join table — a user can't follow the same player twice.

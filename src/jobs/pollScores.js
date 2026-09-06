@@ -110,6 +110,17 @@ function wicketsOf(match) {
   return out;
 }
 
+// Sibling of wicketsOf: the runs half of each team's "runs/wkts" score string.
+function runsOf(match) {
+  const score = match?.score;
+  if (!score || typeof score !== 'object') return {};
+  const out = {};
+  for (const [team, val] of Object.entries(score)) {
+    out[team] = Number(String(val).split('/')[0]) || 0;
+  }
+  return out;
+}
+
 // Order-independent stringify: sort object keys so `{a,b}` and `{b,a}` compare
 // equal. Good enough for the small, flat score/wickets maps here.
 function stable(value) {
@@ -157,6 +168,69 @@ export function diffMatches(before = [], after = []) {
   }
 
   return changes;
+}
+
+// ── Semantic events (Phase 7) ───────────────────────────────────────────────
+
+/**
+ * Turn a raw `changes[]` (from diffMatches) into semantic events the
+ * notification handlers react to. Pure — no side effects, exported only so the
+ * unit tests can drive it directly.
+ *
+ * Limitation: the normalized match shape (src/lib/cricketSchemas.js) has no
+ * per-batter data, so `wicketFallen` cannot name the dismissed player
+ * (Notification.playerId stays null) and `milestoneReached` is a team-total
+ * runs figure at 50-run steps, not an individual fifty/century.
+ *
+ * @param {{ polledAt: string, changes: object[] }} input
+ * @returns {{ name: string, payload: object }[]}
+ */
+export function deriveMatchEvents({ polledAt, changes }) {
+  const events = [];
+  for (const c of changes ?? []) {
+    // matchStarted: status moved into 'live' (or a brand-new match already live).
+    if (
+      (c.type === 'changed' && c.fields.includes('status') && c.after?.status === 'live') ||
+      (c.type === 'added' && c.after?.status === 'live')
+    ) {
+      events.push({
+        name: 'matchStarted',
+        payload: { matchId: c.id, teams: c.after.teams, polledAt },
+      });
+    }
+    if (c.type !== 'changed') continue;
+
+    // wicketFallen: a team's wicket count increased (wickets is derived from the
+    // score map — see wicketsOf).
+    if (c.fields.includes('wickets')) {
+      const before = wicketsOf(c.before);
+      const after = wicketsOf(c.after);
+      for (const [team, w] of Object.entries(after)) {
+        if (w > (before[team] ?? 0)) {
+          events.push({
+            name: 'wicketFallen',
+            payload: { matchId: c.id, teamName: team, wickets: w, delta: w - (before[team] ?? 0), polledAt },
+          });
+        }
+      }
+    }
+
+    // milestoneReached: a team's run total crossed a multiple of 50.
+    if (c.fields.includes('score')) {
+      const prev = runsOf(c.before);
+      for (const [team, runs] of Object.entries(runsOf(c.after))) {
+        const prevRuns = prev[team] ?? 0;
+        const crossed = Math.floor(runs / 50) * 50;
+        if (crossed >= 50 && Math.floor(prevRuns / 50) < Math.floor(runs / 50)) {
+          events.push({
+            name: 'milestoneReached',
+            payload: { matchId: c.id, teamName: team, runs, milestone: crossed, polledAt },
+          });
+        }
+      }
+    }
+  }
+  return events;
 }
 
 // ── The job body ────────────────────────────────────────────────────────────
@@ -235,6 +309,11 @@ export async function runPollOnce({
     await redis.set(snapshotKey, JSON.stringify({ polledAt, matches }));
     await warmCache(matches);
     notifier.emit('matchUpdated', { polledAt, matches, changes });
+    // Fan the same diff out as semantic events. `emit` is synchronous — the
+    // handlers start their own async work and settle on their own; nothing to
+    // await here. Idempotency is inherited: a retried/overlapping poll yields
+    // `0 changed` above and this loop runs zero times.
+    for (const e of deriveMatchEvents({ polledAt, changes })) notifier.emit(e.name, e.payload);
     logger.info(`poll #${n}: ${matches.length} matches, ${changes.length} changed`);
     return { changes };
   } finally {
