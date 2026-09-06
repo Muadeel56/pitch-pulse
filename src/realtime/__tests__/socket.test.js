@@ -118,6 +118,27 @@ describe('join-match / leave-match', () => {
     // our handler touches nothing; Socket.io clears rooms on a real disconnect.
     expect(logger.debug).toHaveBeenCalledWith(expect.stringMatching(/disconnected/));
   });
+
+  it('a mid-session disconnect leaves the notifier bridge intact for later emits', () => {
+    const socket = makeFakeSocket();
+    connectionHandler()(socket);
+    socket.trigger('join-match', '3');
+    socket.trigger('disconnect', 'transport close');
+
+    // listener count unchanged — the bridge is process-wide, not per-socket
+    expect(notifier.listenerCount('matchUpdated')).toBe(baseListenerCount + 1);
+
+    // a subsequent broadcast for that match still works and does not throw
+    const emit = vi.fn();
+    vi.spyOn(io, 'to').mockReturnValue({ emit });
+    expect(() =>
+      notifier.emit('matchUpdated', {
+        polledAt: 'now',
+        changes: [{ id: '3', type: 'changed', after: match3, fields: ['score'] }],
+      }),
+    ).not.toThrow();
+    expect(emit).toHaveBeenCalledWith('scoreUpdate', expect.objectContaining({ id: '3' }));
+  });
 });
 
 describe('notifier → room broadcast', () => {

@@ -219,7 +219,9 @@ describe('runPollOnce — Phase 5 cache writes', () => {
 
     expect(res.changes).toHaveLength(1);
     expect(matchUpdated).toHaveBeenCalledTimes(1);
-    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/cache write failed/));
+    // cacheSet now swallows a connection error itself (Phase 8) — warmCache's
+    // own catch is belt-and-braces and no longer the one that fires.
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/Redis SET match:.* failed/));
   });
 });
 

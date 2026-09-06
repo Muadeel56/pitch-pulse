@@ -3,8 +3,13 @@ import jwt from 'jsonwebtoken';
 import { prisma } from '../lib/prisma.js';
 import { signupSchema, loginSchema } from '../schemas/auth.js';
 
+// Tighter than the global limit — credential endpoints are the ones worth
+// brute-forcing. Only enforced when @fastify/rate-limit is registered (it is,
+// in server.js); harmless config otherwise, so the route tests are unaffected.
+const AUTH_RATE_LIMIT = { config: { rateLimit: { max: 10, timeWindow: '5 minutes' } } };
+
 export default async function authRoutes(fastify) {
-  fastify.post('/auth/signup', async (request, reply) => {
+  fastify.post('/auth/signup', AUTH_RATE_LIMIT, async (request, reply) => {
     const parsed = signupSchema.safeParse(request.body);
     if (!parsed.success) {
       return reply.code(400).send({
@@ -30,7 +35,7 @@ export default async function authRoutes(fastify) {
     return reply.code(201).send({ id: user.id, email: user.email, createdAt: user.createdAt });
   });
 
-  fastify.post('/auth/login', async (request, reply) => {
+  fastify.post('/auth/login', AUTH_RATE_LIMIT, async (request, reply) => {
     const parsed = loginSchema.safeParse(request.body);
     if (!parsed.success) {
       return reply.code(400).send({

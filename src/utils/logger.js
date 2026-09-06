@@ -1,29 +1,32 @@
-// A tiny leveled logger for a long-running server. `debug` only prints when
-// LOG_LEVEL=debug is set — no CLI arg-parsing entrypoint here to toggle it at
-// runtime, so it's env-driven (12-factor config) rather than a setter.
+// Structured logging (Phase 10). Backed by `pino`: JSON lines in production
+// (NODE_ENV=production), human-readable via `pino-pretty` everywhere else.
+// `pino-pretty` is a dev dependency and is only referenced on the non-prod
+// path, so a production install without it is fine.
 //
-// Raw ANSI escape codes (no `chalk`) keep this zero-dependency: `\x1b[<code>m`
-// switches the terminal to a color, `\x1b[0m` resets it. `pino` structured
-// logging is deferred to Phase 10.
-const isDebug = process.env.LOG_LEVEL === 'debug';
+// The exported surface is deliberately unchanged from the old hand-rolled
+// console logger — `logger.info/warn/error/debug(msg[, fields])` — so the ~15
+// modules that `import { logger }` don't need touching. Level is env-driven
+// (LOG_LEVEL, default `info`); `debug` messages only render when LOG_LEVEL=debug.
+import pino from 'pino';
 
-export const colors = {
-  red: (s) => `\x1b[31m${s}\x1b[0m`,
-  green: (s) => `\x1b[32m${s}\x1b[0m`,
-  yellow: (s) => `\x1b[33m${s}\x1b[0m`,
-  cyan: (s) => `\x1b[36m${s}\x1b[0m`,
-  gray: (s) => `\x1b[90m${s}\x1b[0m`,
-};
+const usePretty =
+  process.env.NODE_ENV !== 'production' && process.env.NODE_ENV !== 'test';
 
-function ts() {
-  return new Date().toISOString();
-}
+const base = pino({
+  level: process.env.LOG_LEVEL || 'info',
+  transport: usePretty
+    ? { target: 'pino-pretty', options: { translateTime: 'SYS:standard', ignore: 'pid,hostname' } }
+    : undefined,
+});
 
+// pino's signature is (mergeObject, message); ours is (message, mergeObject).
 export const logger = {
-  info: (msg) => console.log(colors.cyan(`[${ts()}] ${msg}`)),
-  warn: (msg) => console.warn(colors.yellow(`[${ts()}] ⚠ ${msg}`)),
-  error: (msg) => console.error(colors.red(`[${ts()}] ✗ ${msg}`)),
-  debug: (msg) => {
-    if (isDebug) console.error(colors.gray(`[${ts()}] [debug] ${msg}`));
-  },
+  info: (msg, fields) => base.info(fields ?? {}, msg),
+  warn: (msg, fields) => base.warn(fields ?? {}, msg),
+  error: (msg, fields) => base.error(fields ?? {}, msg),
+  debug: (msg, fields) => base.debug(fields ?? {}, msg),
 };
+
+// The raw pino instance, for anything that wants child loggers or to hand
+// Fastify a logger later (a noted follow-up — server.js still uses this wrapper).
+export { base as pinoLogger };

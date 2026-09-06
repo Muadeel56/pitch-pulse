@@ -10,7 +10,7 @@ import errorHandlerPlugin from '../../plugins/errorHandler.js';
 import matchesRoutes from '../matches.js';
 import { redisClient, cacheSet, CACHE_KEYS } from '../../cache/redisClient.js';
 import { getLiveMatches, getMatchDetail } from '../../lib/cricketApiClient.js';
-import { ApiUnavailableError, NotFoundError } from '../../errors.js';
+import { ApiUnavailableError, ApiParseError, NotFoundError } from '../../errors.js';
 import { logger } from '../../utils/logger.js';
 
 vi.mock('../../lib/cricketApiClient.js', () => ({
@@ -87,6 +87,15 @@ describe('GET /matches/live', () => {
     expect(res.statusCode).toBe(503);
     expect(res.json().error.code).toBe('SERVICE_UNAVAILABLE');
   });
+
+  it('cache miss + malformed upstream body (ApiParseError) → 502 BAD_GATEWAY', async () => {
+    getLiveMatches.mockRejectedValue(new ApiParseError('bad shape'));
+
+    const res = await app.inject({ method: 'GET', url: '/matches/live' });
+
+    expect(res.statusCode).toBe(502);
+    expect(res.json().error.code).toBe('BAD_GATEWAY');
+  });
 });
 
 describe('GET /matches/:id', () => {
@@ -121,6 +130,16 @@ describe('GET /matches/:id', () => {
 
     expect(res.statusCode).toBe(404);
     expect(res.json().error.code).toBe('NOT_FOUND');
+    expect(await redisClient.get(CACHE_KEYS.detail(DETAIL_ID))).toBeNull();
+  });
+
+  it('cache miss + malformed upstream body (ApiParseError) → 502, nothing cached', async () => {
+    getMatchDetail.mockRejectedValue(new ApiParseError('bad shape'));
+
+    const res = await app.inject({ method: 'GET', url: `/matches/${DETAIL_ID}` });
+
+    expect(res.statusCode).toBe(502);
+    expect(res.json().error.code).toBe('BAD_GATEWAY');
     expect(await redisClient.get(CACHE_KEYS.detail(DETAIL_ID))).toBeNull();
   });
 });

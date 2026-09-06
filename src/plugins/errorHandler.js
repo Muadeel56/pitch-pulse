@@ -46,6 +46,29 @@ export default async function errorHandlerPlugin(fastify) {
       });
     }
 
+    // Postgres unreachable mid-request (container stopped, network blip, pool
+    // exhausted). Prisma reconnects on its own on the next query, so the fix is
+    // a clean, retryable 503 — never a raw 500 or a crashed process. Checked
+    // AFTER the P2002 branch above so a unique-constraint hit still maps to 409
+    // (P2002 is a known-request error but not a connection code).
+    const isDbDown =
+      err instanceof Prisma.PrismaClientInitializationError ||
+      err instanceof Prisma.PrismaClientRustPanicError ||
+      (err instanceof Prisma.PrismaClientKnownRequestError &&
+        ['P1000', 'P1001', 'P1002', 'P1008', 'P1017'].includes(err.code));
+
+    if (isDbDown) {
+      logger.error(
+        `Database unavailable on ${request.method} ${request.url}: ${err.code ?? err.name}`,
+      );
+      return reply.code(503).send({
+        error: {
+          message: 'Database is temporarily unavailable, please retry',
+          code: 'DB_UNAVAILABLE',
+        },
+      });
+    }
+
     // Upstream data-provider failures — degrade cleanly instead of a raw 500.
     if (err instanceof ApiParseError) {
       logger.error(`Upstream parse error on ${request.method} ${request.url}: ${err.message}`);
